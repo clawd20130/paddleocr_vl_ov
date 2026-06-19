@@ -1119,6 +1119,9 @@ class PaddleOCRVL:
         vision_int8_quant: bool = False,
         llm_int8_compress: bool = False,
         llm_int8_quant: bool = False,
+        vlm_min_pixels: Optional[int] = None,
+        vlm_max_pixels: Optional[int] = None,
+        vlm_skip_labels: Optional[List[str]] = None,
     ):
         """
         初始化 PaddleOCR-VL Pipeline
@@ -1154,6 +1157,9 @@ class PaddleOCRVL:
         ]
         self.cache_dir = cache_dir
         self.layout_precision = layout_precision
+        self.vlm_min_pixels = vlm_min_pixels
+        self.vlm_max_pixels = vlm_max_pixels
+        self.vlm_skip_labels = set(vlm_skip_labels or [])
 
         # NOTE: DocLayoutV3-ov 当前仅提供单一 xml，不再根据 layout_precision 选择文件。
         # 保留该参数仅用于兼容旧调用，不做校验/分支选择。
@@ -1348,6 +1354,10 @@ class PaddleOCRVL:
         max_new_tokens: Optional[int] = None,
         prompt_label: str = "ocr",
         vlm_batch_size: int = 8,
+        early_stop_ratio: float = 0.0,
+        vlm_min_pixels: Optional[int] = None,
+        vlm_max_pixels: Optional[int] = None,
+        vlm_skip_labels: Optional[List[str]] = None,
         **kwargs,
     ):
         """
@@ -1361,6 +1371,10 @@ class PaddleOCRVL:
             layout_unclip_ratio: 坐标扩展比例
             layout_merge_bboxes_mode: 布局框合并模式
             max_new_tokens: 最大生成 token 数
+            early_stop_ratio: VLM batch 早停比例，0 表示关闭
+            vlm_min_pixels: VLM 图像预处理最小像素数，None 表示使用初始化默认值
+            vlm_max_pixels: VLM 图像预处理最大像素数，None 表示使用初始化默认值
+            vlm_skip_labels: 跳过 VLM 识别并从解析结果移除的 layout label 列表
             **kwargs: 其他参数
 
         Yields:
@@ -1446,6 +1460,10 @@ class PaddleOCRVL:
                 use_ocr_for_image_block=use_ocr_for_image_block,
                 layout_shape_mode=layout_shape_mode,
                 vlm_batch_size=vlm_batch_size,
+                early_stop_ratio=early_stop_ratio,
+                vlm_min_pixels=vlm_min_pixels,
+                vlm_max_pixels=vlm_max_pixels,
+                vlm_skip_labels=vlm_skip_labels,
             )
             _t_vlm = time.time() - _t_vlm_start
             if _PIPELINE_VERBOSE:
@@ -1690,6 +1708,10 @@ class PaddleOCRVL:
         use_ocr_for_image_block: Optional[bool] = None,
         layout_shape_mode: str = "auto",
         vlm_batch_size: int = 8,
+        early_stop_ratio: float = 0.0,
+        vlm_min_pixels: Optional[int] = None,
+        vlm_max_pixels: Optional[int] = None,
+        vlm_skip_labels: Optional[List[str]] = None,
     ):
         """
         处理视觉语言模型部分（布局解析）
@@ -1730,6 +1752,10 @@ class PaddleOCRVL:
             use_ocr_for_image_block=bool(use_ocr_for_image_block) if use_ocr_for_image_block is not None else self.use_ocr_for_image_block,
             layout_shape_mode=layout_shape_mode,
             vlm_batch_size=vlm_batch_size,
+            early_stop_ratio=early_stop_ratio,
+            vlm_min_pixels=vlm_min_pixels,
+            vlm_max_pixels=vlm_max_pixels,
+            vlm_skip_labels=vlm_skip_labels,
         )
 
         # 组装结果
@@ -1780,6 +1806,9 @@ class PaddleOCRVL:
         layout_shape_mode: str = "auto",
         vlm_batch_size: int = 8,
         early_stop_ratio: float = 0.0,
+        vlm_min_pixels: Optional[int] = None,
+        vlm_max_pixels: Optional[int] = None,
+        vlm_skip_labels: Optional[List[str]] = None,
     ):
         """
         获取布局解析结果（参考 PaddleX 的实现，确保逻辑一致）
@@ -1798,8 +1827,21 @@ class PaddleOCRVL:
         # - allow spotting branch
         has_spotting = False
         drop_figures_set = set()
-        default_min_pixels = 112896
-        default_max_pixels = 1003520
+        default_min_pixels = (
+            vlm_min_pixels
+            if vlm_min_pixels is not None
+            else self.vlm_min_pixels if self.vlm_min_pixels is not None else 112896
+        )
+        default_max_pixels = (
+            vlm_max_pixels
+            if vlm_max_pixels is not None
+            else self.vlm_max_pixels if self.vlm_max_pixels is not None else 1003520
+        )
+        skip_labels = (
+            set(vlm_skip_labels)
+            if vlm_skip_labels is not None
+            else set(self.vlm_skip_labels)
+        )
 
         batch_dict_by_pixel = {}
         id2pixel_key_map = {}
@@ -1822,6 +1864,13 @@ class PaddleOCRVL:
         for i, (image, layout_det_res, imgs_in_doc_for_img) in enumerate(zip(images, layout_det_results, imgs_in_doc)):
             layout_det_res = filter_overlap_boxes(layout_det_res, layout_shape_mode=layout_shape_mode)
             boxes = layout_det_res["boxes"]
+            if skip_labels:
+                boxes = [
+                    box
+                    for box in boxes
+                    if str(box.get("label", "")) not in skip_labels
+                ]
+                layout_det_res["boxes"] = boxes
             # 对齐 PaddleX：不在 parsing 阶段额外重排 boxes。
             # PaddleX 直接使用 layout_det_res["boxes"] 的原始顺序（仅做 filter_overlap_boxes），
             # 后续 crop/merge 都依赖该顺序，从而保证 parsing_res_list 的块顺序一致。
@@ -2307,9 +2356,17 @@ class PaddleOCRVL:
                 pil_images.append(block_img)
 
         # Step 1b: 一次性 batch vision encoding
+        image_processor_config = {}
+        if min_pixels is not None:
+            image_processor_config["min_pixels"] = min_pixels
+        if max_pixels is not None:
+            image_processor_config["max_pixels"] = max_pixels
         _t_vision_start = time.time()
         try:
-            vision_results = self.vlm_model.batch_encode_images(pil_images)
+            vision_results = self.vlm_model.batch_encode_images(
+                pil_images,
+                image_processor_config=image_processor_config or None,
+            )
         except Exception as e:
             print(f"Warning: batch_encode_images failed: {e}, falling back to per-block encoding")
             vision_results = None
@@ -2336,7 +2393,10 @@ class PaddleOCRVL:
                         messages, img_embeds, img_grid_thw,
                     )
                 else:
-                    prepared = self.vlm_model.prepare_inputs(messages)
+                    prepared = self.vlm_model.prepare_inputs(
+                        messages,
+                        image_processor_config=image_processor_config or None,
+                    )
             except Exception as e:
                 print(f"Warning: prepare_inputs failed for block {idx}: {e}")
                 prepared = None
@@ -2694,4 +2754,3 @@ class PaddleOCRVL:
             self.core = None
         except Exception:
             pass
-
