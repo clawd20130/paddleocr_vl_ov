@@ -21,6 +21,8 @@ from openvino.preprocess import PrePostProcessor
 
 import time
 import warnings
+import re
+import os
 from transformers.utils.chat_template_utils import render_jinja_template
 
 # 设为 True 可打开 batch 推理的详细日志
@@ -38,6 +40,31 @@ NON_TEXT_PENALTY_LABELS = {
 
 # 文本类 block 使用的 repetition_penalty 值（>1.0 = 抑制重复）
 TEXT_REPETITION_PENALTY = 1.2
+
+# In the HF tokenizer used by this OpenVINO path, the numeric PaddleOCR-VL
+# location tokens decode as ordinary text, so skip_special_tokens=True is not
+# enough to remove a generated coordinate stream.
+# Keep them only for spotting, where they are the expected structured output.
+LOC_TOKEN_ID_START = 100297
+LOC_TOKEN_ID_END = 101300
+SPOTTING_LABELS = {"spotting"}
+LOC_TOKEN_TEXT_RE = re.compile(r"(?:<\|LOC_(?:BEGIN|END|SEP|\d+)\|>\s*)+")
+
+
+def _openvino_config_from_env():
+    mapping = {
+        "PADDLEOCRVL_OV_PERFORMANCE_HINT": "PERFORMANCE_HINT",
+        "PADDLEOCRVL_OV_NUM_STREAMS": "NUM_STREAMS",
+        "PADDLEOCRVL_OV_HINT_NUM_REQUESTS": "PERFORMANCE_HINT_NUM_REQUESTS",
+        "PADDLEOCRVL_OV_CACHE_DIR": "CACHE_DIR",
+        "PADDLEOCRVL_OV_DYNAMIC_QUANTIZATION_GROUP_SIZE": "DYNAMIC_QUANTIZATION_GROUP_SIZE",
+    }
+    config = {}
+    for env_name, ov_name in mapping.items():
+        value = os.environ.get(env_name)
+        if value is not None and value != "":
+            config[ov_name] = value
+    return config
 
 # 默认聊天模板（PaddleOCR-VL 格式）
 _DEFAULT_CHAT_TEMPLATE = """{%- if not add_generation_prompt is defined -%}
@@ -269,12 +296,13 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         self.vision_int8_quant = vision_int8_quant
         self.llm_int8_quant = llm_int8_quant
 
-        ov_config = {
+        quant_config = {
             "DYNAMIC_QUANTIZATION_GROUP_SIZE": "64",  #32
             "PERFORMANCE_HINT": "LATENCY",
             "NUM_STREAMS": "1",
             "CACHE_DIR": "",
         }
+        self.ov_config = _openvino_config_from_env()
 
         # 根据压缩选项加载相应的模型
         if llm_int4_compress:
@@ -284,9 +312,9 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         else:
             self.llm_model = Path(f"{ov_model_path}/llm_stateful.xml")
         if llm_int8_quant:
-            self.llm_compiled_model = core.compile_model(self.llm_model, device, config = ov_config)
+            self.llm_compiled_model = self._compile_model(self.llm_model, device, config=quant_config)
         else:
-            self.llm_compiled_model = core.compile_model(self.llm_model, device)
+            self.llm_compiled_model = self._compile_model(self.llm_model, device)
 
         self.llm_request = self.llm_compiled_model.create_infer_request()
 
@@ -307,7 +335,7 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         self._supports_cache_class = False
 
         self.llm_embd = core.read_model(Path(f"{ov_model_path}/llm_embd.xml"))
-        self.llm_embd_compiled_model = core.compile_model(self.llm_embd, device)
+        self.llm_embd_compiled_model = self._compile_model(self.llm_embd, device)
         self.llm_embd_request = self.llm_embd_compiled_model.create_infer_request()
 
         self.tokenizer = AutoTokenizer.from_pretrained(ov_model_path, trust_remote_code=True)
@@ -323,18 +351,28 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         self.rope_deltas = None
 
 
+    def _compile_model(self, model, device, config=None):
+        compile_config = {}
+        if config:
+            compile_config.update(config)
+        compile_config.update(self.ov_config)
+        if compile_config:
+            return self.core.compile_model(model, device, config=compile_config)
+        return self.core.compile_model(model, device)
+
+
     def vision_model_init(self):
         if self.vision_int8_quant:
             self.vision_encoder_model = Path(f"{self.ov_model_path}/vision_int8.xml")
         else:
             self.vision_encoder_model = Path(f"{self.ov_model_path}/vision.xml")
         # self.vision_encoder_compiled_model = self.core.compile_model(self.vision_encoder_model, self.ov_device, config = {'INFERENCE_PRECISION_HINT': 'f32'})
-        self.vision_encoder_compiled_model = self.core.compile_model(self.vision_encoder_model, self.ov_device)
+        self.vision_encoder_compiled_model = self._compile_model(self.vision_encoder_model, self.ov_device)
 
         self.vision_encoder_request = self.vision_encoder_compiled_model.create_infer_request()
 
         self.vision_mlp_model = self.core.read_model(Path(f"{self.ov_model_path}/vision_mlp.xml"))
-        self.vision_mlp_compiled_model = self.core.compile_model(self.vision_mlp_model, self.ov_device)
+        self.vision_mlp_compiled_model = self._compile_model(self.vision_mlp_model, self.ov_device)
         self.vision_mlp_request = self.vision_mlp_compiled_model.create_infer_request()
 
         # self.vision_pre_process = Preprocess()
@@ -989,6 +1027,28 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         logits.scatter_(-1, prev_tokens.unsqueeze(0), score.unsqueeze(0))
         return logits
 
+    @staticmethod
+    def _allows_loc_tokens(block_label):
+        return str(block_label or "").strip().lower() in SPOTTING_LABELS
+
+    @staticmethod
+    def _suppress_loc_tokens(logits, block_label):
+        if OVPaddleOCRVLForCausalLM._allows_loc_tokens(block_label):
+            return logits
+        vocab_size = logits.shape[-1]
+        if vocab_size <= LOC_TOKEN_ID_START:
+            return logits
+        end = min(vocab_size, LOC_TOKEN_ID_END + 1)
+        fill_value = torch.finfo(logits.dtype).min if logits.dtype.is_floating_point else -1e9
+        logits[..., LOC_TOKEN_ID_START:end] = fill_value
+        return logits
+
+    @staticmethod
+    def _clean_decoded_response(response, block_label):
+        if OVPaddleOCRVLForCausalLM._allows_loc_tokens(block_label):
+            return response
+        return LOC_TOKEN_TEXT_RE.sub("", response)
+
     def generate_from_prepared(self, prepared, generation_config, stopping_criteria=None, block_label=None):
         """
         从已准备好的 inputs 执行自回归生成（LLM decode 阶段）。
@@ -1015,9 +1075,14 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
             generate_kwargs["repetition_penalty"] = 1.0
         if stopping_criteria is not None:
             generate_kwargs["stopping_criteria"] = stopping_criteria
+        if not self._allows_loc_tokens(block_label):
+            existing = set(generate_kwargs.get("suppress_tokens") or [])
+            existing.update(range(LOC_TOKEN_ID_START, LOC_TOKEN_ID_END + 1))
+            generate_kwargs["suppress_tokens"] = sorted(existing)
         generation_output = self.generate(**generate_kwargs)
         output_token_count = generation_output.shape[1]
         response = self.tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
+        response = self._clean_decoded_response(response, block_label)
 
         infer_times = list(self.llm_infer_list)
         first_token_latency_ms = infer_times[0] if len(infer_times) > 0 else 0.0
@@ -1066,8 +1131,10 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
                 1.0 if lb in NON_TEXT_PENALTY_LABELS else TEXT_REPETITION_PENALTY
                 for lb in block_labels
             ]
+            slot_labels = block_labels
         else:
             slot_penalties = [repetition_penalty] * batch_size
+            slot_labels = [None] * batch_size
 
         if _BATCH_VERBOSE:
             print(f"    [BatchGen] batch_generate called, batch_size={batch_size}, slot_penalties={slot_penalties}", flush=True)
@@ -1129,6 +1196,7 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         for i in range(batch_size):
             row_logits = logits[i, 0, :].unsqueeze(0)
             row_logits = self._apply_repetition_penalty(row_logits, generated_ids[i], slot_penalties[i])
+            row_logits = self._suppress_loc_tokens(row_logits, slot_labels[i])
             next_token = row_logits.squeeze(0).argmax().item()
             generated_ids[i].append(next_token)
             if next_token == eos_token_id or len(generated_ids[i]) >= max_new_tokens:
@@ -1216,6 +1284,7 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
 
                 row_logits = logits[i, 0, :].unsqueeze(0)
                 row_logits = self._apply_repetition_penalty(row_logits, generated_ids[i], slot_penalties[i])
+                row_logits = self._suppress_loc_tokens(row_logits, slot_labels[i])
                 next_token = row_logits.squeeze(0).argmax().item()
                 generated_ids[i].append(next_token)
 
@@ -1236,6 +1305,7 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
             if finished[i]:
                 output_ids = torch.tensor([generated_ids[i]], dtype=torch.long)
                 response = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
+                response = self._clean_decoded_response(response, slot_labels[i])
 
                 if n_decode > 0 and decode_times:
                     per_seq_decode = decode_times[:n_decode]
