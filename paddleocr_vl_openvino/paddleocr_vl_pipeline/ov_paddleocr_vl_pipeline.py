@@ -6,11 +6,6 @@ import time
 import cv2
 import numpy as np
 from pathlib import Path
-
-# 设为 True 可打开 batch 推理的详细日志
-_BATCH_VERBOSE = False
-# 设为 False 可关闭 Pipeline 布局检测/VLM 推理的耗时日志
-_PIPELINE_VERBOSE = False
 from typing import Union, List, Optional, Dict, Any
 from functools import partial
 import random
@@ -49,6 +44,19 @@ except ImportError:
     MODELSCOPE_AVAILABLE = False
     logging.warning("modelscope not installed. Auto-download feature will be disabled. Install with: pip install modelscope")
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# 设为 True 可打开 batch 推理的详细日志
+_BATCH_VERBOSE = _env_flag("PADDLEOCRVL_OV_BATCH_VERBOSE", False)
+# 设为 False 可关闭 Pipeline 布局检测/VLM 推理的耗时日志
+_PIPELINE_VERBOSE = _env_flag("PADDLEOCRVL_OV_PIPELINE_VERBOSE", False)
+
 # 导入布局检测相关函数
 from ..pp_doclayoutv2.ov_pp_layoutv2_infer import (
     preprocess_image_doclayout,
@@ -60,12 +68,18 @@ from ..pp_doclayoutv2.result import LayoutAnalysisResult
 
 # 导入 VLM 模型
 from ..paddleocr_vl.ov_paddleocr_vl import OVPaddleOCRVLForCausalLM, NON_TEXT_PENALTY_LABELS, TEXT_REPETITION_PENALTY
+from ..paddleocr_vl.device_policy import (
+    validate_layout_device as _validate_layout_device,
+    validate_vlm_device as _validate_vlm_device,
+)
+from ..paddleocr_vl.layout_runtime import prepare_layout_model_for_device
 
 # 导入图像处理
 from ..paddleocr_vl.image_processing_paddleocr_vl import PaddleOCRVLImageProcessor
 from ..paddleocr_vl.uilts import (
     convert_otsl_to_html,
     crop_margin,
+    fast_merge_text_blocks,
     filter_overlap_boxes,
     merge_blocks,
     post_process_for_spotting,
@@ -78,6 +92,29 @@ from ..paddleocr_vl.uilts import (
 BLOCK_LABEL_MAP = {
     "image_labels": ["image", "figure"],
 }
+
+
+def _env_int_optional(name: str) -> Optional[int]:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        logging.warning("Ignoring invalid %s=%r; expected integer", name, value)
+        return None
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logging.warning("Ignoring invalid %s=%r; expected float", name, value)
+        return default
+
 
 def gather_imgs(original_img: np.ndarray, layout_det_objs: List[Dict]) -> List[Dict]:
     """
@@ -1105,8 +1142,8 @@ class PaddleOCRVL:
         self,
         layout_model_path: Optional[str] = None,
         vlm_model_path: Optional[str] = None,
-        vlm_device: str = "CPU",
-        layout_device: str = "CPU",
+        vlm_device: str = "GPU",
+        layout_device: str = "NPU",
         use_layout_detection: bool = True,
         use_chart_recognition: bool = True,
         use_seal_recognition: bool = False,
@@ -1122,6 +1159,10 @@ class PaddleOCRVL:
         vlm_min_pixels: Optional[int] = None,
         vlm_max_pixels: Optional[int] = None,
         vlm_skip_labels: Optional[List[str]] = None,
+        vlm_fast_text_merge: Optional[bool] = None,
+        vlm_fast_text_merge_labels: Optional[List[str]] = None,
+        vlm_fast_text_merge_max_blocks: Optional[int] = None,
+        vlm_fast_text_merge_max_aspect: Optional[float] = None,
     ):
         """
         初始化 PaddleOCR-VL Pipeline
@@ -1129,8 +1170,8 @@ class PaddleOCRVL:
         Args:
             layout_model_path: 布局检测模型路径（OpenVINO IR .xml 文件），如果为 None 则自动下载
             vlm_model_path: VLM 模型路径（包含 vision.xml, vision_mlp.xml, llm_stateful.xml 等的目录），如果为 None 则自动下载
-            vlm_device: VLM 模型推理设备 ("CPU", "GPU", "AUTO")
-            layout_device: 布局检测模型（PP-DocLayoutV2）推理设备，默认 "CPU" ("CPU", "GPU", "NPU", "AUTO")
+            vlm_device: VLM 模型推理设备 ("CPU", "GPU")；不支持 NPU/AUTO
+            layout_device: 布局检测模型（PP-DocLayoutV2）推理设备，默认 "NPU" ("CPU", "GPU", "NPU")
             use_layout_detection: 是否使用布局检测
             use_chart_recognition: 是否使用图表识别
             merge_layout_blocks: 是否合并布局块
@@ -1143,8 +1184,8 @@ class PaddleOCRVL:
                 - "combined_fp32": FP32 合并模型（合并了 batch size 和 boxes 节点）
                 注意：如果指定了 layout_model_path 为具体的 .xml 文件路径，此参数将被忽略
         """
-        self.vlm_device = vlm_device
-        self.layout_device = layout_device
+        self.vlm_device = _validate_vlm_device(vlm_device)
+        self.layout_device = _validate_layout_device(layout_device)
         self.use_layout_detection = use_layout_detection
         self.use_chart_recognition = use_chart_recognition
         # 对齐 PaddleX：seal / image-block OCR 的默认开关需要保存在 pipeline 上
@@ -1157,9 +1198,45 @@ class PaddleOCRVL:
         ]
         self.cache_dir = cache_dir
         self.layout_precision = layout_precision
-        self.vlm_min_pixels = vlm_min_pixels
-        self.vlm_max_pixels = vlm_max_pixels
+        self.vlm_min_pixels = (
+            vlm_min_pixels
+            if vlm_min_pixels is not None
+            else _env_int_optional("PADDLEOCRVL_OV_IMAGE_MIN_PIXELS")
+        )
+        self.vlm_max_pixels = (
+            vlm_max_pixels
+            if vlm_max_pixels is not None
+            else _env_int_optional("PADDLEOCRVL_OV_IMAGE_MAX_PIXELS")
+        )
         self.vlm_skip_labels = set(vlm_skip_labels or [])
+        self.last_vlm_profile: Dict[str, Any] = {}
+        self.vlm_fast_text_merge = (
+            bool(vlm_fast_text_merge)
+            if vlm_fast_text_merge is not None
+            else _env_flag("PADDLEOCRVL_OV_FAST_TEXT_MERGE", False)
+        )
+        merge_labels_value = os.environ.get(
+            "PADDLEOCRVL_OV_FAST_TEXT_MERGE_LABELS",
+            "text,paragraph_title,vision_footnote",
+        )
+        self.vlm_fast_text_merge_labels = {
+            item.strip()
+            for item in (
+                vlm_fast_text_merge_labels
+                if vlm_fast_text_merge_labels is not None
+                else merge_labels_value.split(",")
+            )
+            if item.strip()
+        }
+        self.vlm_fast_text_merge_max_blocks = (
+            vlm_fast_text_merge_max_blocks
+            if vlm_fast_text_merge_max_blocks is not None
+            else _env_int_optional("PADDLEOCRVL_OV_FAST_TEXT_MERGE_MAX_BLOCKS") or 4
+        )
+        self.vlm_fast_text_merge_max_aspect = _env_float(
+            "PADDLEOCRVL_OV_FAST_TEXT_MERGE_MAX_ASPECT",
+            4.0,
+        ) if vlm_fast_text_merge_max_aspect is None else float(vlm_fast_text_merge_max_aspect)
 
         # NOTE: DocLayoutV3-ov 当前仅提供单一 xml，不再根据 layout_precision 选择文件。
         # 保留该参数仅用于兼容旧调用，不做校验/分支选择。
@@ -1315,13 +1392,11 @@ class PaddleOCRVL:
 
     def _load_layout_model(self):
         """加载布局检测模型"""
-        model = self.core.read_model(self.layout_model_path)
-
-        # 添加预处理
-        prep = ov.preprocess.PrePostProcessor(model)
-        prep.input("image").tensor().set_layout(ov.Layout("NCHW"))
-        prep.input("image").preprocess().scale([255, 255, 255])
-        model = prep.build()
+        model = prepare_layout_model_for_device(
+            self.core,
+            self.layout_model_path,
+            self.layout_device,
+        )
 
         # 编译模型（使用 layout_device）
         self.layout_compiled_model = self.core.compile_model(model, self.layout_device)
@@ -1794,6 +1869,168 @@ class PaddleOCRVL:
 
         return PaddleOCRVLResult(single_img_res)
 
+    def _build_paddleocrvl_result_from_parts(
+        self,
+        results_cv: dict,
+        parsing_res_list: List["PaddleOCRVLBlock"],
+        table_res_list: List,
+        spotting_res: dict,
+        imgs_in_doc_for_image: List,
+        use_chart_recognition: Optional[bool] = None,
+        use_seal_recognition: Optional[bool] = None,
+        use_ocr_for_image_block: Optional[bool] = None,
+        layout_shape_mode: str = "auto",
+    ):
+        doc_preprocessor_image = results_cv["doc_preprocessor_image"]
+        layout_det_results = results_cv["layout_det_results"]
+
+        single_img_res = {
+            "input_path": results_cv["input_path"],
+            "page_index": results_cv["page_index"],
+            "page_count": results_cv["page_count"],
+            "width": doc_preprocessor_image.shape[1],
+            "height": doc_preprocessor_image.shape[0],
+            "doc_preprocessor_res": results_cv["doc_preprocessor_res"],
+            "layout_det_res": layout_det_results[0] if layout_det_results else None,
+            "table_res_list": table_res_list,
+            "parsing_res_list": parsing_res_list,
+            "spotting_res": spotting_res,
+            "imgs_in_doc": imgs_in_doc_for_image,
+            "model_settings": {
+                "use_doc_preprocessor": False,
+                "use_layout_detection": self.use_layout_detection,
+                "use_chart_recognition": bool(use_chart_recognition) if use_chart_recognition is not None else self.use_chart_recognition,
+                "use_seal_recognition": bool(use_seal_recognition) if use_seal_recognition is not None else self.use_seal_recognition,
+                "use_ocr_for_image_block": bool(use_ocr_for_image_block) if use_ocr_for_image_block is not None else self.use_ocr_for_image_block,
+                "format_block_content": False,
+                "merge_layout_blocks": self.merge_layout_blocks,
+                "markdown_ignore_labels": self.markdown_ignore_labels,
+                "return_layout_polygon_points": False if layout_shape_mode == "rect" else True,
+            },
+        }
+        return PaddleOCRVLResult(single_img_res)
+
+    def predict_batch_lane(
+        self,
+        input: Union[str, List[str], np.ndarray, List[np.ndarray]],
+        max_images_per_flush: int = 1,
+        use_layout_detection: Optional[bool] = None,
+        use_chart_recognition: Optional[bool] = None,
+        use_seal_recognition: Optional[bool] = None,
+        use_ocr_for_image_block: Optional[bool] = None,
+        layout_threshold: Optional[Union[float, dict]] = None,
+        layout_nms: Optional[bool] = None,
+        layout_unclip_ratio: Optional[Union[float, tuple]] = None,
+        layout_merge_bboxes_mode: Optional[str] = None,
+        layout_shape_mode: Optional[str] = "auto",
+        max_new_tokens: Optional[int] = None,
+        prompt_label: str = "ocr",
+        vlm_batch_size: int = 128,
+        early_stop_ratio: float = 0.75,
+        vlm_min_pixels: Optional[int] = None,
+        vlm_max_pixels: Optional[int] = None,
+        vlm_skip_labels: Optional[List[str]] = None,
+        merge_tables_across_images: bool = False,
+        **kwargs,
+    ):
+        """
+        Batch-lane prediction for independent images.
+
+        This keeps the same layout/crop and VLM implementation as ``predict()``,
+        but moves the VLM batch boundary across multiple images. It is intended
+        for throughput-oriented services that can flush a small image window to
+        the GPU together. By default it disables cross-image table merging
+        because independent requests/images must not be treated as one
+        multi-page document.
+        """
+        if max_images_per_flush <= 0:
+            raise ValueError("max_images_per_flush must be >= 1")
+
+        if use_layout_detection is None:
+            use_layout_detection = self.use_layout_detection
+        if use_chart_recognition is None:
+            use_chart_recognition = self.use_chart_recognition
+        if use_seal_recognition is None:
+            use_seal_recognition = self.use_seal_recognition
+        if use_ocr_for_image_block is None:
+            use_ocr_for_image_block = self.use_ocr_for_image_block
+        if layout_shape_mode is None:
+            layout_shape_mode = "auto"
+
+        if not use_layout_detection and isinstance(prompt_label, str):
+            if prompt_label.lower() == "seal":
+                use_seal_recognition = True
+            elif prompt_label.lower() == "chart":
+                use_chart_recognition = True
+
+        if isinstance(input, (str, np.ndarray)):
+            inputs = [input]
+        elif isinstance(input, list):
+            inputs = input
+        else:
+            raise ValueError(f"Unsupported input type: {type(input)}")
+
+        for chunk_start in range(0, len(inputs), max_images_per_flush):
+            chunk_inputs = inputs[chunk_start : chunk_start + max_images_per_flush]
+            results_cv = []
+            for inp in chunk_inputs:
+                if isinstance(inp, str):
+                    image = cv2.imread(inp)
+                    input_path = inp
+                elif isinstance(inp, np.ndarray):
+                    image = inp
+                    input_path = None
+                else:
+                    raise ValueError(f"Unsupported input item type: {type(inp)}")
+                if image is None:
+                    raise ValueError(f"Failed to load image: {inp}")
+
+                results_cv.append(
+                    self._process_cv(
+                        image,
+                        input_path,
+                        use_layout_detection=use_layout_detection,
+                        layout_threshold=layout_threshold,
+                        layout_nms=layout_nms,
+                        layout_unclip_ratio=layout_unclip_ratio,
+                        layout_merge_bboxes_mode=layout_merge_bboxes_mode,
+                        layout_shape_mode=layout_shape_mode,
+                        prompt_label=prompt_label,
+                    )
+                )
+
+            parsing_res_lists, table_res_lists, spotting_res_lists, imgs_in_doc = (
+                self.get_layout_parsing_results(
+                    [result_cv["doc_preprocessor_image"] for result_cv in results_cv],
+                    [result_cv["layout_det_results"][0] for result_cv in results_cv],
+                    [result_cv["imgs_in_doc"][0] for result_cv in results_cv],
+                    max_new_tokens=max_new_tokens or 4096,
+                    use_chart_recognition=bool(use_chart_recognition),
+                    use_seal_recognition=bool(use_seal_recognition),
+                    use_ocr_for_image_block=bool(use_ocr_for_image_block),
+                    layout_shape_mode=layout_shape_mode,
+                    vlm_batch_size=vlm_batch_size,
+                    early_stop_ratio=early_stop_ratio,
+                    vlm_min_pixels=vlm_min_pixels,
+                    vlm_max_pixels=vlm_max_pixels,
+                    vlm_skip_labels=vlm_skip_labels,
+                    merge_tables_across_pages=merge_tables_across_images,
+                )
+            )
+
+            for idx, result_cv in enumerate(results_cv):
+                yield self._build_paddleocrvl_result_from_parts(
+                    result_cv,
+                    parsing_res_lists[idx] if idx < len(parsing_res_lists) else [],
+                    table_res_lists[idx] if idx < len(table_res_lists) else [],
+                    spotting_res_lists[idx] if idx < len(spotting_res_lists) else {},
+                    imgs_in_doc[idx] if idx < len(imgs_in_doc) else [],
+                    use_chart_recognition=use_chart_recognition,
+                    use_seal_recognition=use_seal_recognition,
+                    use_ocr_for_image_block=use_ocr_for_image_block,
+                    layout_shape_mode=layout_shape_mode,
+                )
+
     def get_layout_parsing_results(
         self,
         images: List[np.ndarray],
@@ -1809,6 +2046,7 @@ class PaddleOCRVL:
         vlm_min_pixels: Optional[int] = None,
         vlm_max_pixels: Optional[int] = None,
         vlm_skip_labels: Optional[List[str]] = None,
+        merge_tables_across_pages: bool = True,
     ):
         """
         获取布局解析结果（参考 PaddleX 的实现，确保逻辑一致）
@@ -1911,6 +2149,14 @@ class PaddleOCRVL:
                 blocks_for_img = merge_blocks(
                     blocks_for_img,
                     non_merge_labels=image_labels + ["table"],
+                    layout_shape_mode=layout_shape_mode,
+                )
+            if self.vlm_fast_text_merge:
+                blocks_for_img = fast_merge_text_blocks(
+                    blocks_for_img,
+                    merge_labels=self.vlm_fast_text_merge_labels,
+                    max_blocks=self.vlm_fast_text_merge_max_blocks,
+                    max_aspect_ratio=self.vlm_fast_text_merge_max_aspect,
                     layout_shape_mode=layout_shape_mode,
                 )
 
@@ -2121,7 +2367,7 @@ class PaddleOCRVL:
 
         # 对齐 PaddleX：跨页 merge_table 后回写 global_group_id（见 PaddleX layout_parsing/merge_table.py）
         # 仅当存在多页时才尝试合并；best-effort，不影响主流程。
-        if len(parsing_res_lists) > 1:
+        if merge_tables_across_pages and len(parsing_res_lists) > 1:
             try:
                 parsing_res_lists = self._merge_tables_across_pages_paddlex(parsing_res_lists)
             except Exception as e:
@@ -2330,6 +2576,7 @@ class PaddleOCRVL:
         import time
 
         n_blocks = len(block_imgs)
+        self.last_vlm_profile = {}
 
         generation_config = {
             "bos_token_id": self.vlm_model.tokenizer.bos_token_id,
@@ -2342,6 +2589,7 @@ class PaddleOCRVL:
         # Phase 1: 批量预处理（图像处理 + vision 编码 + text embedding）
         _t_phase1_start = time.time()
         prepared_list = []
+        block_prepare_times = []
 
         # Step 1a: 转换所有图像为 PIL
         pil_images = []
@@ -2404,6 +2652,7 @@ class PaddleOCRVL:
             _t_prep = time.time() - _t_prep_start
             input_tokens = prepared["inputs_embeds"].shape[1] if prepared is not None else 0
             block_info = block_infos[idx] if block_infos and idx < len(block_infos) else {}
+            block_prepare_times.append(_t_prep)
             prepared_list.append({
                 "prepared": prepared,
                 "pil_image": pil_image,
@@ -2413,6 +2662,17 @@ class PaddleOCRVL:
             })
 
         _t_phase1 = time.time() - _t_phase1_start
+        self.last_vlm_profile = {
+            "blocks": n_blocks,
+            "phase1_s": _t_phase1,
+            "vision_s": _t_vision,
+            "text_position_s": _t_phase1 - _t_vision,
+            "prepare_avg_s": (
+                sum(block_prepare_times) / len(block_prepare_times)
+                if block_prepare_times else 0.0
+            ),
+            "prepare_max_s": max(block_prepare_times) if block_prepare_times else 0.0,
+        }
         if _BATCH_VERBOSE:
             print(f"    [VLM] Phase1 批量预处理 {n_blocks} 个块: {_t_phase1:.3f}s (vision编码={_t_vision:.3f}s, 文本+位置={_t_phase1 - _t_vision:.3f}s)")
 
@@ -2455,8 +2715,10 @@ class PaddleOCRVL:
                 batch_labels = [item[2] for item in batch_items]
                 batch_prev_ids = [item[3] for item in batch_items]
 
-                # Only early-stop if there are more items waiting to backfill
-                use_early_stop = early_stop_ratio if len(work_queue) > 0 else 0.0
+                # Allow early-stop even when no new work is waiting: if only a
+                # few slots are still decoding, resume them as a smaller batch
+                # instead of carrying finished slots through every decode step.
+                use_early_stop = early_stop_ratio if len(batch_items) > 1 else 0.0
 
                 if _BATCH_VERBOSE:
                     n_resumed_in = sum(1 for _, _, _, prev, _ in batch_items if prev)
@@ -2557,6 +2819,13 @@ class PaddleOCRVL:
                 results[idx] = {"result": result_str}
 
         _t_phase2 = time.time() - _t_phase2_start
+        self.last_vlm_profile.update(
+            {
+                "phase2_s": _t_phase2,
+                "total_s": _t_phase1 + _t_phase2,
+                "batch_size": batch_size,
+            }
+        )
         if _BATCH_VERBOSE:
             print(f"    [VLM] Phase2 LLM生成 {n_blocks} 个块: {_t_phase2:.3f}s, 平均={_t_phase2/n_blocks:.3f}s/块")
             print(f"    [VLM] 总计: {_t_phase1 + _t_phase2:.3f}s (预处理={_t_phase1:.3f}s + 生成={_t_phase2:.3f}s)")

@@ -10,6 +10,10 @@ from paddleocr_vl_openvino.paddleocr_vl_pipeline import PaddleOCRVL
 import tempfile
 import json
 import openvino as ov
+from paddleocr_vl_openvino.paddleocr_vl.device_policy import (
+    is_supported_layout_device,
+    is_supported_vlm_device,
+)
 
 # 全局变量存储 pipeline 实例
 pipeline = None
@@ -18,11 +22,8 @@ pipeline = None
 def get_available_devices():
     """通过 OpenVINO Core 查询系统可用的推理设备列表"""
     core = ov.Core()
-    devices = core.available_devices  # e.g. ['CPU', 'GPU.0', 'GPU.1', 'NPU']
-    # 始终保留 AUTO 选项
-    if "AUTO" not in devices:
-        devices.append("AUTO")
-    return devices
+    return core.available_devices  # e.g. ['CPU', 'GPU.0', 'GPU.1', 'NPU']
+
 
 # 在导入后立即设置环境变量，避免Gradio初始化时的网络请求
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
@@ -168,21 +169,41 @@ def create_gradio_interface():
                 )
             with gr.Row():
                 available_devices = get_available_devices()
-                def _pick_default(devices):
-                    for pref in ["AUTO","GPU","CPU"]:
+                vlm_devices = [
+                    device
+                    for device in available_devices
+                    if is_supported_vlm_device(device)
+                ]
+                layout_devices = [
+                    device
+                    for device in available_devices
+                    if is_supported_layout_device(device)
+                ]
+                if not vlm_devices:
+                    vlm_devices = ["CPU"]
+                if not layout_devices:
+                    layout_devices = ["CPU"]
+
+                def _pick_default(devices, preferences):
+                    for pref in preferences:
                         if pref in devices:
                             return pref
+                        pref_prefix = f"{pref}."
+                        for device in devices:
+                            if device.startswith(pref_prefix):
+                                return device
                     return devices[0]
-                default_device = _pick_default(available_devices)
+                default_vlm_device = _pick_default(vlm_devices, ["GPU", "CPU"])
+                default_layout_device = _pick_default(layout_devices, ["NPU", "GPU", "CPU"])
 
                 vlm_device = gr.Dropdown(
-                    choices=available_devices,
-                    value=default_device,
+                    choices=vlm_devices,
+                    value=default_vlm_device,
                     label="VLM 推理设备"
                 )
                 layout_device = gr.Dropdown(
-                    choices=available_devices,
-                    value=default_device,
+                    choices=layout_devices,
+                    value=default_layout_device,
                     label="布局检测推理设备"
                 )
             
@@ -310,8 +331,8 @@ def create_gradio_interface():
             
             - **布局检测模型路径**：PP-DocLayoutV2 模型的路径（.xml 文件），留空则自动从 ModelScope 下载
             - **VLM 模型路径**：PaddleOCR-VL 模型的目录路径，留空则自动从 ModelScope 下载
-            - **VLM 推理设备**：选择 VLM 模型运行的设备（CPU/GPU/AUTO）
-            - **布局检测推理设备**：选择布局检测模型运行的设备（CPU/GPU/NPU/AUTO）
+            - **VLM 推理设备**：选择 VLM 模型运行的设备（CPU/GPU）
+            - **布局检测推理设备**：选择布局检测模型运行的设备（默认 NPU；可选 CPU/GPU 调试）
             
             #### 量化/压缩设置
             
@@ -364,4 +385,3 @@ if __name__ == "__main__":
         share=False,             # 是否创建公共链接
         inbrowser=True           # 自动在浏览器中打开
     )
-

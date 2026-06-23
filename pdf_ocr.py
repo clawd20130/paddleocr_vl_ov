@@ -38,8 +38,14 @@ def main():
     parser.add_argument("--pdf", type=str, required=True, help="输入 PDF 文件路径")
     parser.add_argument("--output", type=str, default="pdf_output", help="输出目录（默认 pdf_output）")
     parser.add_argument("--dpi", type=int, default=100, help="PDF 渲染 DPI（默认 100）")
-    parser.add_argument("--device", type=str, default="GPU", help="VLM 推理设备：CPU/GPU/AUTO")
-    parser.add_argument("--layout-device", type=str, default="CPU", help="Layout 检测设备（默认 CPU）")
+    parser.add_argument("--device", type=str, default="GPU", choices=["CPU", "GPU"], help="VLM 推理设备：CPU/GPU")
+    parser.add_argument(
+        "--layout-device",
+        type=str,
+        default="NPU",
+        choices=["CPU", "GPU", "NPU"],
+        help="Layout 检测设备：CPU/GPU/NPU（默认 NPU）",
+    )
     parser.add_argument("--vlm-batch-size", type=int, default=40, help="VLM batch size（默认 40）")
     parser.add_argument("--max-new-tokens", type=int, default=1024, help="最大生成 token 数（默认 1024）")
     parser.add_argument("--layout-model-path", type=str, default=None, help="Layout 模型路径（None 自动下载）")
@@ -101,7 +107,7 @@ def main():
     # 判断 CV 和 VLM 是否在同一 GPU 上——若是则串行，否则并行
     def _normalize_device(d):
         d = d.strip().upper()
-        if d in ("CPU", "AUTO"):
+        if d == "CPU":
             return d
         # GPU / GPU.0 / GPU.1 ...
         return d if "." in d else d + ".0"

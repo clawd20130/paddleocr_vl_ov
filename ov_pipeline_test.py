@@ -5,7 +5,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", type=str, default="./test_images/doc_test.png", help="输入图片路径")
     parser.add_argument("--output", type=str, default="output", help="输出目录")
-    parser.add_argument("--device", type=str, default="GPU", help="设备：CPU/GPU/NPU/AUTO")
+    parser.add_argument("--device", type=str, default="GPU", choices=["CPU", "GPU"], help="VLM 设备：CPU/GPU")
+    parser.add_argument(
+        "--layout-device",
+        type=str,
+        default="NPU",
+        choices=["CPU", "GPU", "NPU"],
+        help="完整 pipeline 的 layout 设备：CPU/GPU/NPU；默认 NPU",
+    )
+    parser.add_argument("--layout-model-path", type=str, default=None, help="layout 模型路径；None 表示自动下载")
+    parser.add_argument("--vlm-model-path", type=str, default="./PaddleOCR-VL-1.5-ov", help="VLM 模型目录")
     parser.add_argument(
         "--layout-only",
         action="store_true",
@@ -25,6 +34,7 @@ def main() -> int:
         help="layout 置信度阈值（layout-only / 完整 pipeline 两种模式都生效）",
     )
     args = parser.parse_args()
+    layout_device = args.layout_device
 
     if args.layout_only:
         # 仅布局检测（推荐用于：只想拿到版面框/类型，不需要 VLM 输出）
@@ -32,24 +42,27 @@ def main() -> int:
 
         print("开始 layout detection...")
         result = paddle_ov_doclayout(
-            model_path=None,  # None 表示自动下载/自动选择
+            model_path=args.layout_model_path,  # None 表示自动下载/自动选择
             image_path=args.image,
             output_dir=args.output,
-            device=args.device,
+            device=layout_device,
             threshold=args.layout_threshold,
             precision=args.layout_precision,
         )
-        print(f"完成：检测到 {len(result.boxes)} 个区域，输出目录：{args.output}")
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
+            boxes = result.json.get("res", {}).get("boxes", [])
+        print(f"完成：检测到 {len(boxes)} 个区域，输出目录：{args.output}")
         return 0
 
     # 完整 Pipeline：layout + VLM（OCR / 解析）
     from paddleocr_vl_openvino.paddleocr_vl_pipeline import PaddleOCRVL
 
     pipeline = PaddleOCRVL(
-        layout_model_path="./PP-DoclayoutV3-ov",
-        vlm_model_path="./PaddleOCR-VL-1.5-ov",
+        layout_model_path=args.layout_model_path or "./PP-DoclayoutV3-ov",
+        vlm_model_path=args.vlm_model_path,
         vlm_device=args.device,
-        layout_device=args.device,
+        layout_device=layout_device,
         layout_precision=args.layout_precision,
         llm_int4_compress=False,
         vision_int8_quant=False,

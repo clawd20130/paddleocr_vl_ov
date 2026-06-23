@@ -127,7 +127,7 @@ pipeline = PaddleOCRVL(
     layout_model_path=None,  # Automatically download layout detection model
     vlm_model_path=None,      # Automatically download VLM model
     vlm_device="GPU", 
-    layout_device="CPU",
+    layout_device="NPU",
     layout_precision="fp16",  
     llm_int4_compress=False,  # LLM INT4 quantization compression
     vision_int8_quant=False,  # Vision model INT8 quantization
@@ -164,6 +164,75 @@ The pipeline supports various quantization and compression options to optimize m
 - For **balanced performance**: Use settings (`vision_int8_quant=True`, `llm_int8_compress=True`, `llm_int8_quant=True`, `llm_int4_compress=False`)
 - For **maximum compression**: Use settings (`llm_int4_compress=True`, `llm_int8_quant=True`, `llm_int8_compress=False`) (smallest model size, but may affect accuracy)
 
+### NPU / GPU Placement
+
+The production placement for this project is intentionally narrow:
+
+```python
+pipeline = PaddleOCRVL(
+    layout_model_path=None,
+    vlm_model_path=None,
+    vlm_device="GPU",
+    layout_device="NPU",
+)
+```
+
+Current policy:
+
+- `layout_device="NPU"` is the only supported NPU path. The pipeline reshapes the layout model to static batch size 1 before compiling it for NPU.
+- PaddleOCR-VL itself must stay on explicit `GPU` or `CPU`. This includes the vision encoder, vision MLP, token embedding, and LLM decode.
+- The previous experimental NPU VLM routes were removed from the supported runtime because they were unstable locally and produced OCR output that diverged from CPU/GPU.
+- Do not set `vlm_device` to `NPU`, `AUTO`, `MULTI`, or `HETERO`; the runtime only accepts explicit `GPU`, `GPU.x`, or `CPU` for VLM.
+
+Recommended command-line shape:
+
+```bash
+python ov_pipeline_test.py \
+  --image ./test_images/doc_test.png \
+  --device GPU \
+  --layout-device NPU
+```
+
+Before starting a service, run a bounded placement preflight. By default this
+checks OpenVINO device visibility for both layout and VLM placement, the layout
+model path, and the VLM device policy without running PaddleOCR-VL inference:
+
+```bash
+python tools/layout_npu_preflight.py \
+  --layout-model /path/to/PP-DoclayoutV3-ov \
+  --layout-device NPU \
+  --vlm-device GPU \
+  --json
+```
+
+To verify that the layout IR compiles on the target NPU, add
+`--compile-layout` and run the command under an external timeout in deployment
+automation.
+
+The batch server uses the same policy at startup. It compiles the layout model
+during preflight by default (`PADDLEOCRVL_PREFLIGHT_COMPILE_LAYOUT=1`) and does
+not run a full VLM warmup unless explicitly enabled with
+`PADDLEOCRVL_WARMUP_ENABLED=1`. This keeps startup bounded to layout/NPU checks
+instead of letting an unstable full VLM path terminate the service before the
+first request.
+
+Local bounded verification on the current machine:
+
+```bash
+timeout 180 python tools/layout_npu_preflight.py \
+  --layout-model /home/kevinzhow/models/PP-DoclayoutV3-ov \
+  --layout-device NPU \
+  --vlm-device GPU \
+  --compile-layout \
+  --json
+```
+
+This reported `available_devices=["CPU","GPU","NPU"]`,
+`layout_compile_seconds=0.0746`, and `ok=true`. A layout-only smoke on
+`test_images/paddleocr_vl_demo.png` with the same layout model and
+`layout_device=NPU` detected `31` regions. Neither check runs PaddleOCR-VL VLM
+inference.
+
 ### Method 1: Fully Automatic Download (Recommended)
 
 When model paths are set to `None`, models will be automatically downloaded from ModelScope:
@@ -175,7 +244,7 @@ pipeline = PaddleOCRVL(
     layout_model_path=None,  # Automatic download
     vlm_model_path=None,     # Automatic download
     vlm_device="GPU", 
-    layout_device="CPU",
+    layout_device="NPU",
     layout_precision="fp16",
     llm_int4_compress=False,  # LLM INT4 quantization compression
     vision_int8_quant=False,  # Vision model INT8 quantization
@@ -193,7 +262,7 @@ pipeline = PaddleOCRVL(
     layout_model_path="C:/path/to/existing/model.xml",
     vlm_model_path="C:/path/to/existing/vlm_model",
     vlm_device="GPU", 
-    layout_device="CPU",
+    layout_device="NPU",
     llm_int4_compress=False,
     vision_int8_quant=False,
     llm_int8_compress=False,
@@ -211,7 +280,7 @@ pipeline = PaddleOCRVL(
     layout_model_path=None,  # Automatically download layout detection model
     vlm_model_path=None,     # Automatically download VLM model
     vlm_device="GPU",        # Use GPU for VLM model
-    layout_device="CPU",     # Use CPU for layout detection model
+    layout_device="NPU",     # Use NPU for layout detection model
     layout_precision="fp16",
     llm_int4_compress=False,  # LLM INT4 quantization compression (default: False)
     vision_int8_quant=False,  # Vision model INT8 quantization (default: False)
@@ -245,8 +314,8 @@ for res in output:
 |-----------|------|---------|-------------|
 | `layout_model_path` | `Optional[str]` | `None` | Layout detection model path (.xml file), automatically downloads if `None`. **Note:** If a specific `.xml` file path is provided, the `layout_precision` parameter will be ignored |
 | `vlm_model_path` | `Optional[str]` | `None` | VLM model path (directory containing vision.xml, llm_stateful.xml, etc.), automatically downloads if `None` |
-| `vlm_device` | `str` | `"CPU"` | VLM model inference device: `"CPU"`, `"GPU"`, `"AUTO"` |
-| `layout_device` | `str` | `"CPU"` | Layout detection model inference device: `"CPU"`, `"GPU"`, `"NPU"`, `"AUTO"` |
+| `vlm_device` | `str` | `"GPU"` | VLM model inference device: `"CPU"`, `"GPU"` |
+| `layout_device` | `str` | `"NPU"` | Layout detection model inference device: `"NPU"` by default; `"GPU"`/`"CPU"` are debug fallbacks |
 | `use_layout_detection` | `bool` | `True` | Whether to use layout detection |
 | `use_chart_recognition` | `bool` | `False` | Whether to use chart recognition |
 | `merge_layout_blocks` | `bool` | `True` | Whether to merge layout blocks |
@@ -257,6 +326,13 @@ for res in output:
 | `vision_int8_quant` | `bool` | `False` | Enable Vision model INT8 quantization (balances accuracy and performance) |
 | `llm_int8_compress` | `bool` | `False` | Enable LLM INT8 quantization compression (reduces model size, may slightly affect accuracy) |
 | `llm_int8_quant` | `bool` | `False` | Enable LLM INT8 quantization (improves inference speed, may slightly affect accuracy) |
+| `vlm_min_pixels` | `Optional[int]` | `None` | Override VLM image preprocessing minimum pixels |
+| `vlm_max_pixels` | `Optional[int]` | `None` | Override VLM image preprocessing maximum pixels |
+| `vlm_skip_labels` | `Optional[List[str]]` | `None` | Remove selected layout labels before VLM recognition |
+| `vlm_fast_text_merge` | `Optional[bool]` | `None` | Explicitly enable latency-first text-like block merging; `None` uses `PADDLEOCRVL_OV_FAST_TEXT_MERGE` |
+| `vlm_fast_text_merge_labels` | `Optional[List[str]]` | `None` | Labels eligible for fast text merge; defaults to text-like labels |
+| `vlm_fast_text_merge_max_blocks` | `Optional[int]` | `None` | Maximum number of adjacent blocks per fast-merge group |
+| `vlm_fast_text_merge_max_aspect` | `Optional[float]` | `None` | Maximum merged-image aspect ratio for fast text merge |
 
 #### `predict` Method
 
@@ -352,7 +428,7 @@ pipeline = PaddleOCRVL(
     vlm_model_path=None,
     cache_dir="./models_cache",  # Custom cache directory
     vlm_device="GPU",
-    layout_device="CPU",
+    layout_device="NPU",
     llm_int4_compress=False,
     vision_int8_quant=False,
     llm_int8_compress=False,
@@ -373,8 +449,8 @@ python pdf_ocr.py --pdf input.pdf
 # Specify output directory and rendering DPI
 python pdf_ocr.py --pdf input.pdf --output pdf_output --dpi 150
 
-# Use GPU for VLM, CPU for layout detection
-python pdf_ocr.py --pdf input.pdf --device GPU --layout-device CPU
+# Use GPU for VLM, NPU for layout detection
+python pdf_ocr.py --pdf input.pdf --device GPU --layout-device NPU
 
 # Tune batch size and enable early-stop
 python pdf_ocr.py --pdf input.pdf --vlm-batch-size 40 --early-stop-ratio 0.7
@@ -387,8 +463,8 @@ python pdf_ocr.py --pdf input.pdf --vlm-batch-size 40 --early-stop-ratio 0.7
 | `--pdf` | *(required)* | Input PDF file path |
 | `--output` | `pdf_output` | Output directory |
 | `--dpi` | `100` | PDF rendering DPI |
-| `--device` | `GPU` | VLM inference device (`CPU`/`GPU`/`AUTO`) |
-| `--layout-device` | `CPU` | Layout detection device (`CPU`/`GPU`/`NPU`/`AUTO`) |
+| `--device` | `GPU` | VLM inference device (`CPU`/`GPU`) |
+| `--layout-device` | `NPU` | Layout detection device (`NPU` by default; `GPU`/`CPU` for debug fallback) |
 | `--vlm-batch-size` | `40` | VLM batch size (number of blocks per batch) |
 | `--max-new-tokens` | `1024` | Maximum tokens to generate per block |
 | `--window-pages` | `10` | Pages per processing window (`0` = all pages at once) |

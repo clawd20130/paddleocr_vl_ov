@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Optional, Literal, Dict, Any, List
 
 
-Device = Literal["CPU", "GPU", "NPU", "AUTO"]
-VlmDevice = Literal["CPU", "GPU", "AUTO"]
+Device = Literal["CPU", "GPU", "NPU"]
+VlmDevice = Literal["CPU", "GPU"]
 LayoutPrecision = Literal["fp16", "fp32", "combined_fp16", "combined_fp32"]
 TaskType = Literal["ocr", "table", "chart", "formula"]
 
@@ -94,5 +94,3 @@ def ensure_dir(p: Path) -> None:
 
 SUPPORTED_IMAGE_EXTS: List[str] = [".png", ".jpg", ".jpeg", ".bmp", ".webp"]
 SUPPORTED_DOC_EXTS: List[str] = [".pdf"]
-
-

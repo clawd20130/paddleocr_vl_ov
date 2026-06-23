@@ -389,6 +389,124 @@ def merge_blocks(blocks, non_merge_labels, layout_shape_mode="auto"):
     return result_blocks
 
 
+def fast_merge_text_blocks(
+    blocks,
+    merge_labels=None,
+    max_blocks=4,
+    max_aspect_ratio=4.0,
+    layout_shape_mode="auto",
+):
+    """
+    Optional production-speed merge for VLM OCR-like blocks.
+
+    Consecutive OCR-like layout blocks in the same visual column are stacked
+    into one image, so the VLM does one vision pass and one LLM prefill for the
+    group. Callers must enable this explicitly because it trades block-level
+    fidelity for latency.
+    """
+    if not blocks:
+        return blocks
+    if merge_labels is None:
+        merge_labels = {"text", "paragraph_title", "vision_footnote"}
+    merge_labels = {str(label) for label in merge_labels}
+    max_blocks = max(1, int(max_blocks or 1))
+    max_aspect_ratio = float(max_aspect_ratio or 4.0)
+
+    def can_start(block):
+        return block.get("img") is not None and str(block.get("label", "")) in merge_labels
+
+    def bbox_union(group):
+        xs1 = [float(item["box"][0]) for item in group]
+        ys1 = [float(item["box"][1]) for item in group]
+        xs2 = [float(item["box"][2]) for item in group]
+        ys2 = [float(item["box"][3]) for item in group]
+        return [int(min(xs1)), int(min(ys1)), int(max(xs2)), int(max(ys2))]
+
+    def same_column(prev_box, box):
+        x_overlap = calculate_projection_overlap_ratio(box, prev_box, "horizontal")
+        prev_w = max(1.0, float(prev_box[2] - prev_box[0]))
+        box_w = max(1.0, float(box[2] - box[0]))
+        prev_cx = (float(prev_box[0]) + float(prev_box[2])) / 2.0
+        box_cx = (float(box[0]) + float(box[2])) / 2.0
+        center_close = abs(prev_cx - box_cx) <= max(prev_w, box_w) * 0.35
+        left_close = abs(float(prev_box[0]) - float(box[0])) <= 24
+        right_close = abs(float(prev_box[2]) - float(box[2])) <= 24
+        return x_overlap >= 0.35 or center_close or left_close or right_close
+
+    def can_append(group, block):
+        if len(group) >= max_blocks or not can_start(block):
+            return False
+        prev = group[-1]
+        prev_box = prev["box"]
+        box = block["box"]
+        if not same_column(prev_box, box):
+            return False
+        prev_h = max(1.0, float(prev_box[3] - prev_box[1]))
+        box_h = max(1.0, float(box[3] - box[1]))
+        vertical_gap = float(box[1] - prev_box[3])
+        if vertical_gap > max(prev_h, box_h) * 1.5 + 40:
+            return False
+        if vertical_gap < -max(prev_h, box_h) * 0.5:
+            return False
+        return True
+
+    def alignment(prev_box, box):
+        if abs(float(prev_box[0]) - float(box[0])) <= 24:
+            return "left"
+        if abs(float(prev_box[2]) - float(box[2])) <= 24:
+            return "right"
+        return "center"
+
+    result = []
+    idx = 0
+    while idx < len(blocks):
+        block = blocks[idx]
+        if not can_start(block):
+            result.append(block)
+            idx += 1
+            continue
+
+        group = [block]
+        aligns = []
+        next_idx = idx + 1
+        while next_idx < len(blocks) and can_append(group, blocks[next_idx]):
+            aligns.append(alignment(group[-1]["box"], blocks[next_idx]["box"]))
+            group.append(blocks[next_idx])
+            next_idx += 1
+
+        if len(group) == 1:
+            result.append(block)
+            idx += 1
+            continue
+
+        w, h = calc_merged_wh([item["img"] for item in group])
+        aspect_ratio = h / w if w else float("inf")
+        if aspect_ratio > max_aspect_ratio:
+            result.extend(group)
+            idx = next_idx
+            continue
+
+        merged_img = merge_images([item["img"] for item in group], aligns, layout_shape_mode)
+        group_id = group[0].get("group_id", idx)
+        merged_box = bbox_union(group)
+        for group_offset, source in enumerate(group):
+            item = source.copy()
+            item["group_id"] = group_id
+            if group_offset == 0:
+                item["img"] = merged_img
+                item["box"] = merged_box
+                item["merge_aligns"] = aligns
+                item["fast_merged_count"] = len(group)
+            else:
+                item["img"] = None
+                item["merge_aligns"] = None
+                item["fast_merged_count"] = 0
+            result.append(item)
+        idx = next_idx
+
+    return result
+
+
 # ---------------- Table figure tokenization ----------------
 
 
@@ -941,4 +1059,3 @@ def post_process_for_spotting(input_str: str, w: int, h: int) -> Tuple[str, Dict
     result_str = "\n\n".join(rec_texts)
     spotting_res = {"rec_polys": rec_polys, "rec_texts": rec_texts}
     return result_str, spotting_res
-

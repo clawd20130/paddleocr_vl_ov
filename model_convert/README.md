@@ -3,6 +3,12 @@
 ### PaddleOCR_VL model
 This folder contains scripts to convert a PaddleOCR-VL Hugging Face checkpoint into OpenVINO IR.
 
+> NPU support in this project is limited to the PP-DocLayout model at runtime.
+> The converted PaddleOCR-VL IRs (`vision.xml`, `vision_mlp.xml`,
+> `llm_embd.xml`, `llm_stateful.xml`) are intended to run on GPU/CPU. Do not
+> generate or deploy NPU variants of the PaddleOCR-VL vision or LLM graphs for
+> the production path.
+
 #### Step 1: Replace the Hugging Face `modeling_*.py`
 
 Use the optimized implementation from this repo to overwrite the modeling file in your downloaded HF model directory.
@@ -69,5 +75,3 @@ Then convert the ONNX model to OpenVINO IR:
 ```bash
 ovc PP-DocLayoutV3.onnx --output_model DocLayoutV3.xml
 ```
-
-

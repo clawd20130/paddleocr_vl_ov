@@ -17,6 +17,8 @@ import logging
 # -----------------------------------------------------------------------------
 try:
     from . import processors, result, utils  # type: ignore
+    from ..paddleocr_vl.device_policy import validate_layout_device
+    from ..paddleocr_vl.layout_runtime import prepare_layout_model_for_device
 except ImportError:  # pragma: no cover
     import importlib
     import sys
@@ -31,6 +33,10 @@ except ImportError:  # pragma: no cover
     processors = importlib.import_module("pp_doclayoutv2.processors")
     result = importlib.import_module("pp_doclayoutv2.result")
     utils = importlib.import_module("pp_doclayoutv2.utils")
+    validate_layout_device = importlib.import_module("paddleocr_vl.device_policy").validate_layout_device
+    prepare_layout_model_for_device = importlib.import_module(
+        "paddleocr_vl.layout_runtime"
+    ).prepare_layout_model_for_device
 
 # -----------------------------------------------------------------------------
 # Backward-compat exports (after `result` is imported)
@@ -773,7 +779,7 @@ def paddle_ov_doclayout(model_path, image_path, output_dir, device="GPU", thresh
         model_path: OpenVINO IR model path (.xml file), automatically downloads if None
         image_path: Input image path
         output_dir: Output directory for saving results
-        device: Inference device ("CPU", "GPU", "NPU", "AUTO")
+        device: Inference device ("CPU", "GPU", "NPU")
         threshold: Detection confidence threshold (float or dict)
         layout_nms: Whether to enable NMS (Non-Maximum Suppression)
         layout_unclip_ratio: Box coordinate expansion ratio(s)
@@ -795,28 +801,14 @@ def paddle_ov_doclayout(model_path, image_path, output_dir, device="GPU", thresh
     """
     # Get or download model path
     model_path = _get_model_path(model_path, cache_dir=cache_dir, precision=precision)
+    device = validate_layout_device(device)
     
     # Initialize OpenVINO Core
     core = ov.Core()
     
-    # Load model (.xml file will automatically find corresponding .bin file)
-    model = core.read_model(model_path)
-
-    # Merge preprocessing into model
-    prep = ov.preprocess.PrePostProcessor(model)
-    prep.input("image").tensor().set_layout(ov.Layout("NCHW"))
-    prep.input("image").preprocess().scale([255, 255, 255])
-
-    if device == "NPU":
-        prep.input("im_shape").model().set_layout(ov.Layout('N...'))
-        prep.input("scale_factor").model().set_layout(ov.Layout('N...'))
-        prep.input("image").model().set_layout(ov.Layout('NCHW'))
-
-    model = prep.build()
-
-    # Set batch to make static
-    if device == "NPU":
-        ov.set_batch(model, 1)
+    # Load model and merge the same preprocessing/static-batch policy used by
+    # the main pipeline and deployment preflight.
+    model = prepare_layout_model_for_device(core, model_path, device)
     
     # Compile model
     compiled_model = core.compile_model(model, device)
@@ -982,7 +974,7 @@ def main():
         "--device",
         type=str,
         default="GPU",
-        choices=["CPU", "GPU", "NPU", "AUTO"],
+        choices=["CPU", "GPU", "NPU"],
         help="Inference device (default: GPU)"
     )
     parser.add_argument(

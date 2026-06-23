@@ -27,6 +27,7 @@ from transformers.utils.chat_template_utils import render_jinja_template
 
 # 设为 True 可打开 batch 推理的详细日志
 _BATCH_VERBOSE = False
+from .device_policy import validate_vlm_device as _validate_vlm_device
 from .image_processing_paddleocr_vl import PaddleOCRVLImageProcessor
 import numpy as np
 
@@ -65,6 +66,11 @@ def _openvino_config_from_env():
         if value is not None and value != "":
             config[ov_name] = value
     return config
+
+
+def _reject_unsupported_vlm_device(device: str):
+    return _validate_vlm_device(device)
+
 
 # 默认聊天模板（PaddleOCR-VL 格式）
 _DEFAULT_CHAT_TEMPLATE = """{%- if not add_generation_prompt is defined -%}
@@ -114,6 +120,7 @@ _DEFAULT_CHAT_TEMPLATE = """{%- if not add_generation_prompt is defined -%}
 
 class PaddleOCR_VL_OV:
     def __init__(self, pretrained_model_path=None, model=None, tokenizer=None, ov_model_path='/tmp/paddleocr_vl_ov/', device='CPU', llm_int4_compress=False, llm_int8_compress=False, vision_int8_quant=False):
+        device = _validate_vlm_device(device)
 
         if model is None and pretrained_model_path:
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -288,6 +295,7 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         vision_infer=[],
     ):
 
+        device = _reject_unsupported_vlm_device(device)
         self.ov_model_path = ov_model_path
         self.core = core
         self.ov_device = device

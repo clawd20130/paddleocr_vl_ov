@@ -53,6 +53,17 @@ def model_has_state(ov_model: ov.Model):
     return len(ov_model.get_sinks()) > 0
 
 
+def _validate_vlm_export_device(device: str) -> str:
+    normalized = str(device or "").upper().strip()
+    if normalized == "CPU" or normalized == "GPU" or normalized.startswith("GPU."):
+        return normalized
+    raise ValueError(
+        "PaddleOCR-VL conversion/export devices are restricted to explicit "
+        "CPU/GPU. Do not generate NPU variants of the VLM graphs; NPU is only "
+        "supported for the runtime PP-DocLayout model."
+    )
+
+
 def model_has_input_output_name(ov_model: ov.Model, name: str):
     """
     Helper function for checking that model has specified input or output name
@@ -281,7 +292,7 @@ class LlmStatefulModel:
         self.name = "PaddleOCR_VL LLM Model"
         self.model = model
         self.tokenizer = tokenizer
-        self.device = device
+        self.device = _validate_vlm_export_device(device)
         self.ov_model_path = ov_model_path
         self.fp16 = fp16
         self.int4_compress = int4_compress
@@ -1053,7 +1064,7 @@ class LlmEmbdModel:
     ):
         self.name = "PaddleOCR-VL Embd Model"
         self.model = model
-        self.device = device
+        self.device = _validate_vlm_export_device(device)
         self.ov_model_path = ov_model_path
         self.fp16 = fp16
         self.inputs_dict = {}
@@ -1105,7 +1116,7 @@ class VisionMlpModel:
     ):
         self.name = "Vision Mlp Model"
         self.model = model
-        self.device = device
+        self.device = _validate_vlm_export_device(device)
         self.ov_model_path = ov_model_path
         self.fp16 = fp16
         self.inputs_dict = {}
@@ -1165,7 +1176,7 @@ class VisionModel:
     ):
         self.name = "Vision Encoder Model"
         self.model = model
-        self.device = device
+        self.device = _validate_vlm_export_device(device)
         self.ov_model_path = ov_model_path
         self.fp16 = fp16
         self.inputs_dict = {}
@@ -1494,6 +1505,7 @@ class PaddleOCR_VL_OV:
         llm_int8_compress=False,
         vision_int8_quant=False,
     ):
+        device = _validate_vlm_export_device(device)
 
         if model is None and pretrained_model_path:
             self.model = AutoModelForCausalLM.from_pretrained(pretrained_model_path, trust_remote_code=True)

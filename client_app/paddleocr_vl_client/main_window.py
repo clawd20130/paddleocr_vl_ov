@@ -185,8 +185,16 @@ class MainWindow(QMainWindow):
             self.edit_cache_dir.setText(self._qs_get_str("settings/cache_dir", self.edit_cache_dir.text()))
 
             # Devices / precision
-            self.combo_vlm_device.setCurrentText(self._qs_get_str("settings/vlm_device", self.combo_vlm_device.currentText()))
-            self.combo_layout_device.setCurrentText(self._qs_get_str("settings/layout_device", self.combo_layout_device.currentText()))
+            saved_vlm_device = self._qs_get_str("settings/vlm_device", self.combo_vlm_device.currentText())
+            if self.combo_vlm_device.findText(saved_vlm_device) >= 0:
+                self.combo_vlm_device.setCurrentText(saved_vlm_device)
+            else:
+                self.combo_vlm_device.setCurrentText("GPU")
+            saved_layout_device = self._qs_get_str("settings/layout_device", self.combo_layout_device.currentText())
+            if self.combo_layout_device.findText(saved_layout_device) >= 0:
+                self.combo_layout_device.setCurrentText(saved_layout_device)
+            else:
+                self.combo_layout_device.setCurrentText("NPU")
             # 兼容旧配置：历史上可能保存了 fp32/combined_*，但当前 DocLayoutV3 仅支持 fp16
             self.combo_layout_precision.setCurrentText("fp16")
 
@@ -678,13 +686,13 @@ class MainWindow(QMainWindow):
             w.setFrame(False)
 
         self.combo_vlm_device = QComboBox()
-        self.combo_vlm_device.addItems(["CPU", "GPU", "AUTO"])
+        self.combo_vlm_device.addItems(["CPU", "GPU"])
         self.combo_vlm_device.setCurrentText("GPU")
         self.combo_vlm_device.setFrame(False)
 
         self.combo_layout_device = QComboBox()
-        self.combo_layout_device.addItems(["CPU", "GPU", "NPU", "AUTO"])
-        self.combo_layout_device.setCurrentText("GPU")
+        self.combo_layout_device.addItems(["NPU", "GPU", "CPU"])
+        self.combo_layout_device.setCurrentText("NPU")
         self.combo_layout_device.setFrame(False)
 
         self.combo_layout_precision = QComboBox()
@@ -1736,5 +1744,3 @@ class MainWindow(QMainWindow):
         self._archive_done_indices.clear()
         self._refresh_table()
         self._save_pending_queue()
-
-

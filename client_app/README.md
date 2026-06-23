@@ -130,13 +130,13 @@ Settings affect two kinds of behavior:
 
 ### Devices and precision
 
-- **vlm_device** (`CPU/GPU/AUTO`)
-  - **Recommendation**: prefer `AUTO`; use `CPU` for maximum stability; use `GPU` if the driver/plugins are properly configured
+- **vlm_device** (`CPU/GPU`)
+  - **Recommendation**: use `GPU`; use `CPU` only as a compatibility fallback
 
-- **layout_device** (`CPU/GPU/NPU/AUTO`)
+- **layout_device** (`NPU/GPU/CPU`)
   - **Recommendations**:
-    - for stability: `CPU` or `AUTO`
-    - for speed: use `GPU/NPU` only after you confirm OpenVINO device support is available
+    - production default: `NPU`
+    - use `GPU` or `CPU` only as a debug/compatibility fallback
 
 - **layout_precision** (`fp16 / fp32 / combined_fp16 / combined_fp32`)
   - **Meaning**: selects the layout model variant when `layout_model_path` does not point to a specific `.xml`
@@ -213,5 +213,3 @@ History file:
 
 - **Q: Why does the History page only show the first PDF page as the input preview?**  
   A: By default it uses `pages/page_0001.png` as the input preview; inference runs page-by-page and concatenates results in the Markdown with separators.
-
-
