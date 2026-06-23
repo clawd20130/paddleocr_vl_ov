@@ -68,6 +68,22 @@ def _openvino_config_from_env():
     return config
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _bucketed_length(length: int, bucket: int, max_length: int) -> int:
+    if bucket <= 0:
+        return length
+    return min(max_length, ((length + bucket - 1) // bucket) * bucket)
+
+
 def _reject_unsupported_vlm_device(device: str):
     return _validate_vlm_device(device)
 
@@ -1237,6 +1253,7 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         batch_mask_full[:, :max_seq] = batch_mask[:, :max_seq]
         batch_mask_full_np = batch_mask_full.numpy()
         current_mask_len = max_seq
+        decode_mask_bucket = max(0, _env_int("PADDLEOCRVL_OV_DECODE_MASK_BUCKET", 0))
 
         # Pre-cache pad_token embedding and reusable tensors
         # 必须 .clone()，否则 pad_emb 是 OV 输出 buffer 的 view，
@@ -1283,7 +1300,14 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
                 if not finished[i]:
                     batch_mask_full[i, current_mask_len] = 1
             current_mask_len += 1
-            batch_mask_view_np = batch_mask_full_np[:, :current_mask_len]
+            mask_view_len = current_mask_len
+            if decode_mask_bucket > 0:
+                mask_view_len = _bucketed_length(
+                    current_mask_len,
+                    decode_mask_bucket,
+                    max_total_len,
+                )
+            batch_mask_view_np = batch_mask_full_np[:, :mask_view_len]
 
             for i in range(batch_size):
                 new_pos[:, i, 0] = past_lens[i] + rope_delta_vals[i]
@@ -1300,7 +1324,12 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
             decode_times.append(_t_decode)
 
             if _BATCH_VERBOSE and (step <= 3 or step % 50 == 0):
-                print(f"    [BatchGen] decode step={step}, infer={_t_decode:.1f}ms, mask_len={current_mask_len}, finished={finished}", flush=True)
+                bucket_msg = (
+                    f", mask_view_len={mask_view_len}, bucket={decode_mask_bucket}"
+                    if decode_mask_bucket > 0
+                    else ""
+                )
+                print(f"    [BatchGen] decode step={step}, infer={_t_decode:.1f}ms, mask_len={current_mask_len}{bucket_msg}, finished={finished}", flush=True)
 
             logits = batch_request.get_tensor("logits").data
 

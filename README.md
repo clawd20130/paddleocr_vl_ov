@@ -212,13 +212,38 @@ automation.
 The batch server uses the same policy at startup. It compiles the layout model
 during preflight by default (`PADDLEOCRVL_PREFLIGHT_COMPILE_LAYOUT=1`) and does
 not run a full VLM warmup unless explicitly enabled with
-`PADDLEOCRVL_WARMUP_ENABLED=1`. This keeps startup bounded to layout/NPU checks
-instead of letting an unstable full VLM path terminate the service before the
-first request.
+`PADDLEOCRVL_WARMUP_ENABLED=1`. When enabled, set
+`PADDLEOCRVL_WARMUP_IMAGES=/path/a.png,/path/b.png` to pre-warm representative
+VLM batch-lane shapes in a controlled way; if the list is omitted,
+`PADDLEOCRVL_WARMUP_IMAGE` is used for backward compatibility. This keeps the
+default startup bounded to layout/NPU checks instead of letting an unstable full
+VLM path terminate the service before the first request.
 
 OpenVINO model cache (`CACHE_DIR`) is not enabled by default because service
 traffic can make the cache grow over time. It is only used when
 `PADDLEOCRVL_OV_CACHE_DIR` is explicitly set for a controlled environment.
+
+For GPU decode latency, `PADDLEOCRVL_OV_DECODE_MASK_BUCKET=64` can be used to
+round the per-token `attention_mask` length to a small set of bucketed shapes.
+This reduces OpenVINO GPU dynamic-shape churn without writing a disk cache. The
+default is disabled (`0`) so deployments can validate output quality and latency
+on their own request mix before enabling it.
+
+For throughput-oriented service traffic, pair the decode bucket with a small
+batch-lane flush window:
+
+```bash
+PADDLEOCRVL_OV_DECODE_MASK_BUCKET=64
+PADDLEOCRVL_MAX_IMAGES_PER_FLUSH=2
+PADDLEOCRVL_WARMUP_ENABLED=1
+PADDLEOCRVL_WARMUP_IMAGES=/path/to/representative1.jpg,/path/to/representative2.jpg
+```
+
+On the local OCR Bench Images, this configuration kept the output hashes equal
+to the single-image flush path. The original single-image cold baseline was
+`68.89s / 11 = 6.26s/img`; the recommended warmed throughput pass was
+`33.29s / 11 = 3.03s/img`. A larger flush window (`4`) was slower on the same
+set, so `2` is the current throughput recommendation.
 
 Local bounded verification on the current machine:
 

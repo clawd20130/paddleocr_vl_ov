@@ -4,6 +4,8 @@ import torch
 from paddleocr_vl_openvino.paddleocr_vl.ov_paddleocr_vl import (
     LOC_TOKEN_ID_END,
     OVPaddleOCRVLForCausalLM,
+    _bucketed_length,
+    _env_int,
     _openvino_config_from_env,
 )
 
@@ -58,6 +60,23 @@ def test_openvino_cache_dir_is_env_only(monkeypatch):
 
     monkeypatch.setenv("PADDLEOCRVL_OV_CACHE_DIR", "/tmp/ov-cache")
     assert _openvino_config_from_env()["CACHE_DIR"] == "/tmp/ov-cache"
+
+
+def test_env_int_falls_back_for_unset_or_invalid_values(monkeypatch):
+    monkeypatch.delenv("PADDLEOCRVL_OV_DECODE_MASK_BUCKET", raising=False)
+    assert _env_int("PADDLEOCRVL_OV_DECODE_MASK_BUCKET", 0) == 0
+
+    monkeypatch.setenv("PADDLEOCRVL_OV_DECODE_MASK_BUCKET", "64")
+    assert _env_int("PADDLEOCRVL_OV_DECODE_MASK_BUCKET", 0) == 64
+
+    monkeypatch.setenv("PADDLEOCRVL_OV_DECODE_MASK_BUCKET", "bad")
+    assert _env_int("PADDLEOCRVL_OV_DECODE_MASK_BUCKET", 32) == 32
+
+
+def test_bucketed_length_rounds_up_without_exceeding_max():
+    assert _bucketed_length(326, 0, 400) == 326
+    assert _bucketed_length(326, 64, 400) == 384
+    assert _bucketed_length(385, 64, 400) == 400
 
 
 def test_beam_idx_matches_openvino_i32_input():

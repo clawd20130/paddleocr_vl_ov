@@ -48,6 +48,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_list(name: str) -> List[str]:
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 class OCRRequest(BaseModel):
     image_path: Optional[str] = None
     image_base64: Optional[str] = None
@@ -104,6 +111,7 @@ class ServerSettings(BaseModel):
     llm_int8_quant: bool = False
     result_timeout_seconds: float = 1200.0
     warmup_image: Optional[str] = "/home/kevinzhow/glmocr-bench-images/page.png"
+    warmup_images: List[str] = Field(default_factory=list)
     warmup_enabled: bool = False
     preflight_compile_layout: bool = True
 
@@ -144,6 +152,7 @@ def settings_from_env() -> ServerSettings:
             "PADDLEOCRVL_WARMUP_IMAGE",
             "/home/kevinzhow/glmocr-bench-images/page.png",
         ),
+        warmup_images=_env_list("PADDLEOCRVL_WARMUP_IMAGES"),
         warmup_enabled=_env_bool("PADDLEOCRVL_WARMUP_ENABLED", False),
         preflight_compile_layout=_env_bool("PADDLEOCRVL_PREFLIGHT_COMPILE_LAYOUT", True),
     )
@@ -335,23 +344,38 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
         init_seconds = time.perf_counter() - init_start
 
         warmup_seconds = None
-        if resolved_settings.warmup_enabled and resolved_settings.warmup_image:
-            warmup_start = time.perf_counter()
-            list(
-                pipeline.predict(
-                    resolved_settings.warmup_image,
-                    layout_threshold=0.3,
-                    layout_shape_mode="auto",
-                    use_chart_recognition=False,
-                    use_seal_recognition=False,
-                    vlm_batch_size=resolved_settings.vlm_batch_size,
-                    early_stop_ratio=resolved_settings.early_stop_ratio,
-                    max_new_tokens=resolved_settings.max_new_tokens,
-                    vlm_min_pixels=resolved_settings.vlm_min_pixels,
-                    vlm_max_pixels=resolved_settings.vlm_max_pixels,
-                )
+        warmup_results: List[Dict[str, Any]] = []
+        if resolved_settings.warmup_enabled:
+            warmup_images = (
+                resolved_settings.warmup_images
+                if resolved_settings.warmup_images
+                else ([resolved_settings.warmup_image] if resolved_settings.warmup_image else [])
             )
-            warmup_seconds = time.perf_counter() - warmup_start
+            warmup_total_start = time.perf_counter()
+            for warmup_image in warmup_images:
+                warmup_start = time.perf_counter()
+                list(
+                    pipeline.predict_batch_lane(
+                        [warmup_image],
+                        max_images_per_flush=1,
+                        layout_threshold=0.3,
+                        layout_shape_mode="auto",
+                        use_chart_recognition=False,
+                        use_seal_recognition=False,
+                        vlm_batch_size=resolved_settings.vlm_batch_size,
+                        early_stop_ratio=resolved_settings.early_stop_ratio,
+                        max_new_tokens=resolved_settings.max_new_tokens,
+                        vlm_min_pixels=resolved_settings.vlm_min_pixels,
+                        vlm_max_pixels=resolved_settings.vlm_max_pixels,
+                    )
+                )
+                warmup_results.append(
+                    {
+                        "image": warmup_image,
+                        "seconds": time.perf_counter() - warmup_start,
+                    }
+                )
+            warmup_seconds = time.perf_counter() - warmup_total_start
 
         lane = PaddleOCRVLBatchLane(
             pipeline,
@@ -376,6 +400,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
         app.state.preflight = preflight
         app.state.init_seconds = init_seconds
         app.state.warmup_seconds = warmup_seconds
+        app.state.warmup_results = warmup_results
         try:
             yield
         finally:
@@ -395,6 +420,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
             },
             "init_seconds": app.state.init_seconds,
             "warmup_seconds": app.state.warmup_seconds,
+            "warmup_results": app.state.warmup_results,
         }
 
     @app.get("/v1/models")

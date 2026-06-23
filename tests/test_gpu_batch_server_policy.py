@@ -12,6 +12,8 @@ _ENV_KEYS = [
     "PADDLEOCRVL_VLM_DEVICE",
     "PADDLEOCRVL_MAX_IMAGES_PER_FLUSH",
     "PADDLEOCRVL_WARMUP_ENABLED",
+    "PADDLEOCRVL_WARMUP_IMAGE",
+    "PADDLEOCRVL_WARMUP_IMAGES",
     "PADDLEOCRVL_PREFLIGHT_COMPILE_LAYOUT",
 ]
 
@@ -41,8 +43,26 @@ def test_server_settings_defaults_use_bounded_startup_policy():
         assert settings.vlm_batch_size == 16
         assert settings.preflight_compile_layout is True
         assert settings.warmup_enabled is False
+        assert settings.warmup_images == []
 
     _with_env({}, check)
+
+
+def test_server_settings_parses_warmup_images():
+    def check():
+        settings = settings_from_env()
+        assert settings.warmup_enabled is True
+        assert settings.warmup_image == "/tmp/fallback.png"
+        assert settings.warmup_images == ["/tmp/a.png", "/tmp/b.png"]
+
+    _with_env(
+        {
+            "PADDLEOCRVL_WARMUP_ENABLED": "1",
+            "PADDLEOCRVL_WARMUP_IMAGE": "/tmp/fallback.png",
+            "PADDLEOCRVL_WARMUP_IMAGES": " /tmp/a.png, ,/tmp/b.png ",
+        },
+        check,
+    )
 
 
 def test_server_settings_rejects_unsupported_env_devices():
