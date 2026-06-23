@@ -1428,7 +1428,7 @@ class PaddleOCRVL:
         layout_shape_mode: Optional[str] = "auto",
         max_new_tokens: Optional[int] = None,
         prompt_label: str = "ocr",
-        vlm_batch_size: int = 8,
+        vlm_batch_size: int = 16,
         early_stop_ratio: float = 0.0,
         vlm_min_pixels: Optional[int] = None,
         vlm_max_pixels: Optional[int] = None,
@@ -1618,28 +1618,22 @@ class PaddleOCRVL:
             # 不使用布局检测时，不提取图像
             imgs_in_doc = []
 
-        # 创建 LayoutDetectionResult 对象并获取 json 和 img
-        import os
-        layout_det_result_obj = LayoutDetectionResult(
-            input_path=os.path.abspath(input_path) if input_path else None,
-            boxes=layout_det_res["boxes"],
-            page_index=page_index,
-            input_img=doc_preprocessor_image
-        )
-
-        # 将 layout 可视化结果图保存到 output 目录（用户需求）。
-        # 同时保留环境变量覆盖：PADDLEOCR_VL_DEBUG_SAVE_DIR=/path/to/dir
+        # Layout visualization is opt-in for service performance. Set
+        # PADDLEOCR_VL_DEBUG_SAVE_DIR=/path/to/dir when debugging layout boxes.
         try:
             save_dir = os.environ.get("PADDLEOCR_VL_DEBUG_SAVE_DIR", "").strip()
-            if not save_dir:
-                # 默认保存到 paddleocr_vl_ov/output（与现有测试脚本输出目录保持一致）
-                save_dir = str(Path(__file__).resolve().parents[2] / "output")
-
-            # 避免同名覆盖：加入 page_index
-            base_name = Path(layout_det_result_obj._get_input_fn()).stem
-            page_tag = f"_page_{int(page_index):04d}" if page_index is not None else ""
-            out_file = Path(save_dir) / f"{base_name}{page_tag}_layout_res.png"
-            layout_det_result_obj.save_to_img(save_path=out_file.as_posix())
+            if save_dir and save_dir.lower() not in {"0", "false", "none", "off"}:
+                layout_det_result_obj = LayoutDetectionResult(
+                    input_path=os.path.abspath(input_path) if input_path else None,
+                    boxes=layout_det_res["boxes"],
+                    page_index=page_index,
+                    input_img=doc_preprocessor_image,
+                )
+                # 避免同名覆盖：加入 page_index
+                base_name = Path(layout_det_result_obj._get_input_fn()).stem
+                page_tag = f"_page_{int(page_index):04d}" if page_index is not None else ""
+                out_file = Path(save_dir) / f"{base_name}{page_tag}_layout_res.png"
+                layout_det_result_obj.save_to_img(save_path=out_file.as_posix())
         except Exception:
             pass
 
@@ -1782,7 +1776,7 @@ class PaddleOCRVL:
         use_seal_recognition: Optional[bool] = None,
         use_ocr_for_image_block: Optional[bool] = None,
         layout_shape_mode: str = "auto",
-        vlm_batch_size: int = 8,
+        vlm_batch_size: int = 16,
         early_stop_ratio: float = 0.0,
         vlm_min_pixels: Optional[int] = None,
         vlm_max_pixels: Optional[int] = None,
@@ -1925,7 +1919,7 @@ class PaddleOCRVL:
         layout_shape_mode: Optional[str] = "auto",
         max_new_tokens: Optional[int] = None,
         prompt_label: str = "ocr",
-        vlm_batch_size: int = 128,
+        vlm_batch_size: int = 16,
         early_stop_ratio: float = 0.75,
         vlm_min_pixels: Optional[int] = None,
         vlm_max_pixels: Optional[int] = None,
@@ -2041,7 +2035,7 @@ class PaddleOCRVL:
         use_seal_recognition: bool = False,
         use_ocr_for_image_block: bool = False,
         layout_shape_mode: str = "auto",
-        vlm_batch_size: int = 8,
+        vlm_batch_size: int = 16,
         early_stop_ratio: float = 0.0,
         vlm_min_pixels: Optional[int] = None,
         vlm_max_pixels: Optional[int] = None,
@@ -2679,7 +2673,7 @@ class PaddleOCRVL:
         # Phase 2: LLM 自回归生成（batch 或 sequential）
         _t_phase2_start = time.time()
         results = [None] * n_blocks
-        batch_size = kwargs.get("vlm_batch_size", 4)
+        batch_size = kwargs.get("vlm_batch_size", 16)
         early_stop_ratio = kwargs.get("early_stop_ratio", 0.0)
 
         if n_blocks > 1 and batch_size > 1:

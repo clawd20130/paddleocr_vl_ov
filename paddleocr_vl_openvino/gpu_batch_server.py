@@ -95,7 +95,7 @@ class ServerSettings(BaseModel):
     vlm_device: str = "GPU"
     max_images_per_flush: int = 1
     flush_timeout_seconds: float = 0.05
-    vlm_batch_size: int = 128
+    vlm_batch_size: int = 16
     early_stop_ratio: float = 0.75
     max_new_tokens: int = 1024
     vlm_min_pixels: int = 112896
@@ -132,7 +132,7 @@ def settings_from_env() -> ServerSettings:
         vlm_device=os.environ.get("PADDLEOCRVL_VLM_DEVICE", "GPU"),
         max_images_per_flush=_env_int("PADDLEOCRVL_MAX_IMAGES_PER_FLUSH", 1),
         flush_timeout_seconds=_env_float("PADDLEOCRVL_FLUSH_TIMEOUT_SECONDS", 0.05),
-        vlm_batch_size=_env_int("PADDLEOCRVL_VLM_BATCH_SIZE", 128),
+        vlm_batch_size=_env_int("PADDLEOCRVL_VLM_BATCH_SIZE", 16),
         early_stop_ratio=_env_float("PADDLEOCRVL_EARLY_STOP_RATIO", 0.75),
         max_new_tokens=_env_int("PADDLEOCRVL_MAX_NEW_TOKENS", 1024),
         vlm_min_pixels=_env_int("PADDLEOCRVL_VLM_MIN_PIXELS", 112896),

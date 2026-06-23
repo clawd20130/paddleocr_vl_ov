@@ -308,7 +308,6 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
             "DYNAMIC_QUANTIZATION_GROUP_SIZE": "64",  #32
             "PERFORMANCE_HINT": "LATENCY",
             "NUM_STREAMS": "1",
-            "CACHE_DIR": "",
         }
         self.ov_config = _openvino_config_from_env()
 
@@ -386,6 +385,18 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         # self.vision_pre_process = Preprocess()
         # self.vision_middle_process = Postprocess()
 
+    @staticmethod
+    def _vision_inputs(pixel_values, image_grid_thw):
+        pixel_values = pixel_values.unsqueeze(0)
+        cu_seqlens = [0]
+        for thw in image_grid_thw:
+            cu_seqlens.append(cu_seqlens[-1] + int(torch.prod(thw).item()))
+        return {
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "cu_seqlens": torch.tensor(cu_seqlens, dtype=torch.int32).to(pixel_values.device),
+        }
+
     def vision_encoder_run(self, pixel_values=None, image_grid_thw=None, cu_seqlens=None):
         inputs_dict = {}
         inputs_dict['pixel_values'] = pixel_values
@@ -407,37 +418,8 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         encoder_start = time.perf_counter()
 
         if pixel_values is not None:
-            pixel_values = pixel_values.unsqueeze(0)
-            siglip_position_ids = list()
-            image_grid_hws = list()
-            sample_indices = list()
-            cu_seqlens = [0]
-
-            pro = 0
-            # breakpoint()
-            for idx, thw in enumerate(image_grid_thw):
-                thw_tuple = tuple(thw.detach().cpu().numpy().tolist())
-                numel = np.prod(thw_tuple)
-                image_grid_hws.append(thw_tuple)
-                image_position_ids = torch.arange(numel) % np.prod(thw_tuple[1:])
-                siglip_position_ids.append(image_position_ids)
-                sample_indices.append(torch.full((numel,), idx, dtype=torch.int64))
-                cu_seqlens.append(cu_seqlens[-1] + numel)
-
-            siglip_position_ids = torch.concat(siglip_position_ids, dim=0).to(
-                pixel_values.device
-            )
-            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32).to(
-                pixel_values.device
-            )
-            sample_indices = torch.concat(sample_indices, dim=0).to(
-                pixel_values.device
-            )
-            image_grid_hws = torch.tensor(image_grid_hws, dtype=torch.int64)
-            # print("image_grid_hws: ", image_grid_hws)
-            # print("cu_seqlens: ", cu_seqlens)
-
-            vision_output = self.vision_encoder_run(pixel_values=pixel_values, image_grid_thw=image_grid_thw, cu_seqlens=cu_seqlens)
+            vision_inputs = self._vision_inputs(pixel_values, image_grid_thw)
+            vision_output = self.vision_encoder_run(**vision_inputs)
             encoder_end = time.perf_counter()
             mlp_start = time.perf_counter()
             vit_embeds = self.vision_mlp_run(image_features=vision_output, image_grid_thw=image_grid_thw)
@@ -892,7 +874,6 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
             all_patches.append(pixel_values[offset:offset + n_patch])
             offset += n_patch
 
-        # 逐图 vision encoding
         # 注意：OV vision encoder 内部 Reshape 节点硬编码了 image_grid_thw
         # 第一维=1，不支持多图 batch（即使 cu_seqlens 输入存在）。
         # vision_model 返回的 tensor 是 OV 输出 buffer 的 view，
@@ -1052,6 +1033,31 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         return logits
 
     @staticmethod
+    def _select_next_token_np(logits_row, generated_ids, penalty=1.0, block_label=None):
+        """Apply the same decode filters as the torch path, using a numpy row view."""
+        if penalty != 1.0 and generated_ids:
+            prev_tokens = np.asarray(generated_ids, dtype=np.int64)
+            prev_tokens = prev_tokens[
+                (prev_tokens >= 0) & (prev_tokens < logits_row.shape[-1])
+            ]
+            if prev_tokens.size:
+                prev_tokens = np.unique(prev_tokens)
+                scores = logits_row[prev_tokens]
+                logits_row[prev_tokens] = np.where(scores > 0, scores / penalty, scores * penalty)
+
+        if not OVPaddleOCRVLForCausalLM._allows_loc_tokens(block_label):
+            vocab_size = logits_row.shape[-1]
+            if vocab_size > LOC_TOKEN_ID_START:
+                end = min(vocab_size, LOC_TOKEN_ID_END + 1)
+                if np.issubdtype(logits_row.dtype, np.floating):
+                    fill_value = np.finfo(logits_row.dtype).min
+                else:
+                    fill_value = -1e9
+                logits_row[LOC_TOKEN_ID_START:end] = fill_value
+
+        return int(np.argmax(logits_row))
+
+    @staticmethod
     def _clean_decoded_response(response, block_label):
         if OVPaddleOCRVLForCausalLM._allows_loc_tokens(block_label):
             return response
@@ -1189,7 +1195,7 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         if _BATCH_VERBOSE:
             print(f"    [BatchGen] Prefill done: {_t_prefill:.1f}ms", flush=True)
 
-        logits = torch.from_numpy(batch_request.get_tensor("logits").data)
+        logits = batch_request.get_tensor("logits").data
 
         # 初始化 decode 状态（含恢复：prev_generated_ids 累积到 generated_ids）
         past_lens = list(seq_lens)
@@ -1202,10 +1208,12 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         finished = [False] * batch_size
 
         for i in range(batch_size):
-            row_logits = logits[i, 0, :].unsqueeze(0)
-            row_logits = self._apply_repetition_penalty(row_logits, generated_ids[i], slot_penalties[i])
-            row_logits = self._suppress_loc_tokens(row_logits, slot_labels[i])
-            next_token = row_logits.squeeze(0).argmax().item()
+            next_token = self._select_next_token_np(
+                logits[i, 0, :],
+                generated_ids[i],
+                slot_penalties[i],
+                slot_labels[i],
+            )
             generated_ids[i].append(next_token)
             if next_token == eos_token_id or len(generated_ids[i]) >= max_new_tokens:
                 finished[i] = True
@@ -1217,6 +1225,7 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         max_total_len = max_seq + max_new_tokens
         batch_mask_full = torch.zeros(batch_size, max_total_len, dtype=torch.long)
         batch_mask_full[:, :max_seq] = batch_mask[:, :max_seq]
+        batch_mask_full_np = batch_mask_full.numpy()
         current_mask_len = max_seq
 
         # Pre-cache pad_token embedding and reusable tensors
@@ -1264,7 +1273,7 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
                 if not finished[i]:
                     batch_mask_full[i, current_mask_len] = 1
             current_mask_len += 1
-            batch_mask_view = batch_mask_full[:, :current_mask_len]
+            batch_mask_view_np = batch_mask_full_np[:, :current_mask_len]
 
             for i in range(batch_size):
                 new_pos[:, i, 0] = past_lens[i] + rope_delta_vals[i]
@@ -1272,7 +1281,7 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
             _t_decode_start = time.perf_counter()
             batch_request.start_async({
                 'inputs_embeds': new_embeds_np,
-                'attention_mask': batch_mask_view.numpy(),
+                'attention_mask': batch_mask_view_np,
                 'position_ids': new_pos_np,
                 'beam_idx': beam_idx,
             }, share_inputs=True)
@@ -1283,17 +1292,19 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
             if _BATCH_VERBOSE and (step <= 3 or step % 50 == 0):
                 print(f"    [BatchGen] decode step={step}, infer={_t_decode:.1f}ms, mask_len={current_mask_len}, finished={finished}", flush=True)
 
-            logits = torch.from_numpy(batch_request.get_tensor("logits").data)
+            logits = batch_request.get_tensor("logits").data
 
             for i in range(batch_size):
                 past_lens[i] += 1
                 if finished[i]:
                     continue
 
-                row_logits = logits[i, 0, :].unsqueeze(0)
-                row_logits = self._apply_repetition_penalty(row_logits, generated_ids[i], slot_penalties[i])
-                row_logits = self._suppress_loc_tokens(row_logits, slot_labels[i])
-                next_token = row_logits.squeeze(0).argmax().item()
+                next_token = self._select_next_token_np(
+                    logits[i, 0, :],
+                    generated_ids[i],
+                    slot_penalties[i],
+                    slot_labels[i],
+                )
                 generated_ids[i].append(next_token)
 
                 if next_token == eos_token_id or len(generated_ids[i]) >= max_new_tokens:
@@ -1342,8 +1353,5 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
                     "slot_index": i,
                     "generated_ids": generated_ids[i],
                 })
-
-        # 释放 batch infer request，避免跨次调用 KV cache 状态残留
-        self._batch_request = None
 
         return results, unfinished

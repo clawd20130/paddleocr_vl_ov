@@ -46,7 +46,7 @@ def main():
         choices=["CPU", "GPU", "NPU"],
         help="Layout 检测设备：CPU/GPU/NPU（默认 NPU）",
     )
-    parser.add_argument("--vlm-batch-size", type=int, default=40, help="VLM batch size（默认 40）")
+    parser.add_argument("--vlm-batch-size", type=int, default=16, help="VLM batch size（默认 16）")
     parser.add_argument("--max-new-tokens", type=int, default=1024, help="最大生成 token 数（默认 1024）")
     parser.add_argument("--layout-model-path", type=str, default=None, help="Layout 模型路径（None 自动下载）")
     parser.add_argument("--vlm-model-path", type=str, default=None, help="VLM 模型路径（None 自动下载）")

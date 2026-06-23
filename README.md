@@ -216,6 +216,10 @@ not run a full VLM warmup unless explicitly enabled with
 instead of letting an unstable full VLM path terminate the service before the
 first request.
 
+OpenVINO model cache (`CACHE_DIR`) is not enabled by default because service
+traffic can make the cache grow over time. It is only used when
+`PADDLEOCRVL_OV_CACHE_DIR` is explicitly set for a controlled environment.
+
 Local bounded verification on the current machine:
 
 ```bash
@@ -346,7 +350,7 @@ def predict(
     layout_unclip_ratio: Optional[Union[float, tuple]] = None,
     layout_merge_bboxes_mode: Optional[str] = None,
     max_new_tokens: Optional[int] = None,
-    vlm_batch_size: int = 8,
+    vlm_batch_size: int = 16,
     early_stop_ratio: float = 0.0,
     **kwargs,
 ) -> List[PaddleOCRVLResult]
@@ -361,7 +365,7 @@ def predict(
 - `layout_unclip_ratio`: Layout box expansion ratio (float or tuple `(w_ratio, h_ratio)`)
 - `layout_merge_bboxes_mode`: Layout box merge mode (`"union"`, `"large"`, `"small"`)
 - `max_new_tokens`: Maximum number of tokens to generate for VLM
-- `vlm_batch_size`: Number of image blocks processed in a single VLM batch (default: `8`). Increasing this can speed up inference for documents with many blocks, at the cost of higher memory usage.
+- `vlm_batch_size`: Number of image blocks processed in a single VLM batch (default: `16`). Larger batches can increase padding and GPU pressure; on the local OCR Bench Images, `16` was faster and more stable than `128`.
 - `early_stop_ratio`: Batch early-termination ratio (default: `0.0`, disabled). When set to a value such as `0.7`, the batch loop will stop and flush remaining results once 70% of the current batch's slots have finished, reducing tail-latency on uneven batches.
 
 **Return Value:**
@@ -453,7 +457,7 @@ python pdf_ocr.py --pdf input.pdf --output pdf_output --dpi 150
 python pdf_ocr.py --pdf input.pdf --device GPU --layout-device NPU
 
 # Tune batch size and enable early-stop
-python pdf_ocr.py --pdf input.pdf --vlm-batch-size 40 --early-stop-ratio 0.7
+python pdf_ocr.py --pdf input.pdf --vlm-batch-size 16 --early-stop-ratio 0.7
 ```
 
 **Key arguments:**
@@ -465,7 +469,7 @@ python pdf_ocr.py --pdf input.pdf --vlm-batch-size 40 --early-stop-ratio 0.7
 | `--dpi` | `100` | PDF rendering DPI |
 | `--device` | `GPU` | VLM inference device (`CPU`/`GPU`) |
 | `--layout-device` | `NPU` | Layout detection device (`NPU` by default; `GPU`/`CPU` for debug fallback) |
-| `--vlm-batch-size` | `40` | VLM batch size (number of blocks per batch) |
+| `--vlm-batch-size` | `16` | VLM batch size (number of blocks per batch) |
 | `--max-new-tokens` | `1024` | Maximum tokens to generate per block |
 | `--window-pages` | `10` | Pages per processing window (`0` = all pages at once) |
 | `--early-stop-ratio` | `0.0` | Batch early-termination ratio (`0` = disabled, e.g. `0.7` stops when 70% of a batch is done) |

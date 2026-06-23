@@ -54,7 +54,7 @@ class PaddleOCRVLBatchLane:
         *,
         max_images_per_flush: int = 1,
         flush_timeout_seconds: float = 0.05,
-        vlm_batch_size: int = 128,
+        vlm_batch_size: int = 16,
         default_predict_kwargs: Optional[Dict[str, Any]] = None,
         worker_name: str = "paddleocrvl-gpu-batch-lane",
     ) -> None:

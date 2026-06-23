@@ -38,6 +38,7 @@ def test_server_settings_defaults_use_bounded_startup_policy():
         assert settings.layout_device == "NPU"
         assert settings.vlm_device == "GPU"
         assert settings.max_images_per_flush == 1
+        assert settings.vlm_batch_size == 16
         assert settings.preflight_compile_layout is True
         assert settings.warmup_enabled is False
 

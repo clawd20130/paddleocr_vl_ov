@@ -80,7 +80,7 @@ def process_image(image, use_layout_detection, layout_threshold, max_new_tokens)
             use_layout_detection=use_layout_detection,
             layout_threshold=layout_threshold,
             max_new_tokens=max_new_tokens,
-            vlm_batch_size=30
+            vlm_batch_size=16
         )
         
         # 将生成器转换为列表
