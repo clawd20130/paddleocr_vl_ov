@@ -436,8 +436,14 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
         return True
 
     def _reorder_cache(self, past_key_values: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor) -> Tuple[Tuple[torch.Tensor]]:
-        self.next_beam_idx = np.array(beam_idx)  # save beam_idx to be used as an input in the next iteration
+        self.next_beam_idx = self._beam_idx_array(beam_idx)  # save beam_idx to be used as an input in the next iteration
         return past_key_values
+
+    @staticmethod
+    def _beam_idx_array(value):
+        if isinstance(value, int):
+            return np.arange(value, dtype=np.int32)
+        return np.asarray(value, dtype=np.int32)
 
     def llm_embd_run(self, input_ids):
         llm_embd_inputs = {}
@@ -490,7 +496,11 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
 
         batch_size = inputs_embeds.shape[0]
         if "beam_idx" in self.input_names:
-            inputs_dict["beam_idx"] = self.next_beam_idx if self.next_beam_idx is not None else np.arange(batch_size, dtype=int)
+            inputs_dict["beam_idx"] = (
+                self.next_beam_idx
+                if self.next_beam_idx is not None
+                else self._beam_idx_array(batch_size)
+            )
 
         # print('attention_mask: ', inputs_dict['attention_mask'].shape)
         # print('position_ids: ', inputs_dict['position_ids'])
@@ -1176,7 +1186,7 @@ class OVPaddleOCRVLForCausalLM(GenerationMixin):
             batch_pos[:, i, pad_len:] = p["position_ids"][:, 0, :]
             rope_deltas_list.append(p["rope_deltas"])
 
-        beam_idx = np.arange(batch_size, dtype=np.int64)
+        beam_idx = self._beam_idx_array(batch_size)
 
         # Prefill
         batch_request.reset_state()

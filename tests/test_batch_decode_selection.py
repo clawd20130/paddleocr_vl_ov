@@ -58,3 +58,13 @@ def test_openvino_cache_dir_is_env_only(monkeypatch):
 
     monkeypatch.setenv("PADDLEOCRVL_OV_CACHE_DIR", "/tmp/ov-cache")
     assert _openvino_config_from_env()["CACHE_DIR"] == "/tmp/ov-cache"
+
+
+def test_beam_idx_matches_openvino_i32_input():
+    generated = OVPaddleOCRVLForCausalLM._beam_idx_array(3)
+    assert generated.dtype == np.int32
+    assert generated.tolist() == [0, 1, 2]
+
+    reordered = OVPaddleOCRVLForCausalLM._beam_idx_array(torch.tensor([2, 0, 1]))
+    assert reordered.dtype == np.int32
+    assert reordered.tolist() == [2, 0, 1]
